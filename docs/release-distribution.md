@@ -274,6 +274,20 @@ marker or receipt. The historical uncontained contract retains forwarding checks
 without claiming containment. These expected contracts are not public execution
 evidence.
 
+Pull-request CI also runs `PR published-binary regression` on Linux, macOS and
+Windows. This unprivileged test checks out the exact PR head, downloads the
+installer from the pinned v0.0.10 source commit, and installs that immutable
+published version with the installer's existing checksum and archive checks.
+It uses isolated home, cache/store, binary and temporary directories. The existing
+consumer validator checks install/lifecycle suppression and the platform-specific
+root-script contract.
+The job has read-only repository permissions, no secrets, no release environment
+and no artifact uploads. Its logs identify the PR source, release source, binary
+version and binary digest. These are **pre-merge regression results**, not public
+release readiness, package compatibility, upgrade or website promotion evidence.
+The trusted-main runner and approval gates in public installer smoke remain
+unchanged; this PR lane does not satisfy those release gates.
+
 Latest discovery and the configured Unix upgrade checks depend on their explicit
 installation prerequisites, not on successful supplemental script checks. An
 earlier failure still fails the job. Upgrade reports remain required for attempted
