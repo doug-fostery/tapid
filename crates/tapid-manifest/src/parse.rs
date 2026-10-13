@@ -29,12 +29,34 @@ impl PackageManifest {
         if let Some(value) = object.get("peerDependencies") {
             manifest.peer_dependencies = parse_string_map(value, "peerDependencies", true)?;
         }
+        if let Some(value) = object.get("overrides") {
+            manifest.overrides = parse_string_map(value, "overrides", false)?;
+        }
         if let Some(value) = object.get("scripts") {
             manifest.scripts = parse_string_map(value, "scripts", false)?;
         }
         if let Some(value) = object.get("bin") {
             manifest.bin = Some(parse_bin(value, &manifest.name)?);
         }
+        let known_fields = [
+            "name",
+            "version",
+            "private",
+            "description",
+            "license",
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "overrides",
+            "scripts",
+            "bin",
+        ];
+        manifest.extra = object
+            .iter()
+            .filter(|(key, _)| !known_fields.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         Ok(manifest)
     }
 }
@@ -159,7 +181,10 @@ fn parse_string_map(
         .iter()
         .map(|(name, version)| {
             if validate_names {
-                let candidate = name.strip_prefix("jsr:").unwrap_or(name);
+                let candidate = name
+                    .strip_prefix("jsr:")
+                    .or_else(|| name.strip_prefix("npm:"))
+                    .unwrap_or(name);
                 PackageName::from_str(candidate).map_err(ManifestError::InvalidDependencyName)?;
             }
             let version = version

@@ -1,3 +1,83 @@
+/// Proof that this executable installed private launcher dispatch before application work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateLauncher {
+    executable: Option<std::path::PathBuf>,
+    #[cfg(target_os = "macos")]
+    identity: Option<(u64, u64)>,
+}
+static LAUNCHER: std::sync::OnceLock<PrivateLauncher> = std::sync::OnceLock::new();
+
+/// Call as the first operation in main. Private invocations dispatch and never return.
+/// Subsequent requests retain this opaque token; missing integration fails before spawn.
+pub fn initialize_or_dispatch_private_launcher() -> PrivateLauncher {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    execution::dispatch_private_launcher();
+    LAUNCHER
+        .get_or_init(|| {
+            let executable = std::env::current_exe()
+                .ok()
+                .and_then(|p| std::fs::canonicalize(p).ok());
+            #[cfg(target_os = "macos")]
+            let identity = executable
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    (m.dev(), m.ino())
+                });
+            PrivateLauncher {
+                executable,
+                #[cfg(target_os = "macos")]
+                identity,
+            }
+        })
+        .clone()
+}
+
+// The library test executable needs the same early dispatch as a consumer main.
+#[cfg(all(test, target_os = "macos"))]
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static TEST_LAUNCHER_INIT: extern "C" fn() = {
+    extern "C" fn init() {
+        initialize_or_dispatch_private_launcher();
+    }
+    init
+};
+
+#[cfg(all(test, target_os = "linux"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static TEST_LAUNCHER_INIT_LINUX: extern "C" fn() = {
+    extern "C" fn init() {
+        initialize_or_dispatch_private_launcher();
+    }
+    init
+};
+
+pub mod config;
+mod lifecycle;
+pub use execution::dependency_toolchain_identity;
+pub use lifecycle::{DependencyLifecycleApproval, DependencyLifecyclePolicy, LifecycleTool};
+pub mod execution;
+
+pub use config::{
+    AssuranceLevel, ConfigError, ConfigErrorCategory, ExecutionLimits, FilesystemPolicy,
+    MAX_CONFIG_BYTES, MAX_ENVIRONMENT_COUNT, MAX_GRANT_COUNT, MAX_PROFILE_COUNT, MAX_STRING_BYTES,
+    RunConfig, SandboxMode, SandboxPolicy,
+};
+pub use execution::{
+    BackendIdentity, CleanupConfidence, CompletionEvidence, ContainmentSupport, DimensionEvidence,
+    EnforcementDimension, EnforcementDimensions, EnforcementReceipt, EnforcementScope,
+    ExecutionError, ExecutionErrorCategory, ExecutionOutcome, ExecutionRequest,
+    ExecutionRequestBuilder, FilesystemAccess, FilesystemBindingMode, FilesystemGrantKind,
+    FilesystemGrantSource, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_UNITS, MAX_ARGV_UNITS,
+    MAX_BACKEND_IDENTITY_BYTES, MAX_ENVIRONMENT_BLOCK_UNITS, MAX_ENVIRONMENT_VALUE_UNITS,
+    MAX_EXECUTABLE_SEARCH_PATH_COUNT, MAX_EXECUTABLE_SEARCH_PATH_UNITS,
+    MAX_EXECUTABLE_SEARCH_PATHS_UNITS, MAX_PROGRAM_UNITS, MAX_PROJECT_ROOT_UNITS,
+    ResolvedFilesystemGrant, ResolvedFilesystemGrants, Termination, execute,
+};
+
 use sha2::{Digest, Sha256};
 use std::fmt;
 use tapid_policy::{Decision, Evidence, PolicyDecision, ReasonCode};
@@ -63,13 +143,27 @@ pub enum ValidationError {
     ScriptHashMismatch,
     MissingApproval,
     UnsupportedOs,
+    PolicyDenied,
+    RequestMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnerPlan {
-    pub policy: PolicyDecision,
-    pub approval_required: bool,
-    pub containment_available: bool,
+    policy: PolicyDecision,
+    approval_required: bool,
+    containment_available: bool,
+    request: RunnerRequest,
+}
+impl RunnerPlan {
+    pub fn policy(&self) -> &PolicyDecision {
+        &self.policy
+    }
+    pub fn approval_required(&self) -> bool {
+        self.approval_required
+    }
+    pub fn containment_available(&self) -> bool {
+        self.containment_available
+    }
 }
 impl RunnerPlan {
     pub fn validate_approval(
@@ -77,6 +171,18 @@ impl RunnerPlan {
         request: &RunnerRequest,
         approval: Option<&Approval>,
     ) -> Result<(), ValidationError> {
+        if request.artifact_digest != self.request.artifact_digest {
+            return Err(ValidationError::ArtifactDigestMismatch);
+        }
+        if request.script_hash() != self.request.script_hash() {
+            return Err(ValidationError::ScriptHashMismatch);
+        }
+        if request.unattended != self.request.unattended || request.os != self.request.os {
+            return Err(ValidationError::RequestMismatch);
+        }
+        if self.policy.decision() == Decision::Deny {
+            return Err(ValidationError::PolicyDenied);
+        }
         let Some(approval) = approval else {
             return if self.approval_required {
                 Err(ValidationError::MissingApproval)
@@ -108,6 +214,7 @@ pub fn plan(request: &RunnerRequest, evidence: Vec<Evidence>) -> RunnerPlan {
         policy,
         approval_required,
         containment_available: false,
+        request: request.clone(),
     }
 }
 
@@ -160,9 +267,58 @@ mod tests {
             &r,
             vec![Evidence::inferred(Capability::Network, "heuristic")],
         );
-        assert_eq!(p.policy.decision(), Decision::Deny);
-        assert!(p.approval_required);
+        assert_eq!(p.policy().decision(), Decision::Deny);
+        assert!(p.approval_required());
     }
+    #[test]
+    fn approval_cannot_override_policy_denial() {
+        let cases = [
+            (
+                RunnerRequest {
+                    unattended: true,
+                    ..request()
+                },
+                vec![Evidence::inferred(Capability::Network, "heuristic")],
+            ),
+            (
+                request(),
+                vec![Evidence::ambiguous(Capability::Network, "unclear")],
+            ),
+            (
+                RunnerRequest {
+                    os: "plan9".into(),
+                    ..request()
+                },
+                vec![],
+            ),
+        ];
+        for (r, evidence) in cases {
+            let p = plan(&r, evidence);
+            assert_eq!(p.policy().decision(), Decision::Deny);
+            assert_eq!(
+                p.validate_approval(&r, Some(&Approval::for_request(&r))),
+                Err(ValidationError::PolicyDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn existing_public_api_remains_source_compatible() {
+        let request = RunnerRequest {
+            artifact_digest: "sha256-aaaa".into(),
+            script: "echo compatible".into(),
+            unattended: false,
+            os: "linux".into(),
+        };
+        let hash: ScriptHash = normalized_script_hash(&request.script);
+        let approval: Approval = Approval::for_request(&request);
+        let plan: RunnerPlan = plan(&request, vec![]);
+
+        assert_eq!(hash, request.script_hash());
+        assert_eq!(approval.script_hash, hash);
+        assert!(plan.policy().evidence().is_empty());
+    }
+
     #[test]
     fn unsupported_os_is_explicit_and_not_containment() {
         let r = RunnerRequest {
@@ -170,8 +326,8 @@ mod tests {
             ..request()
         };
         let p = plan(&r, vec![]);
-        assert_eq!(p.policy.decision(), Decision::Deny);
-        assert!(p.policy.reasons().contains(&ReasonCode::UnsupportedOs));
-        assert!(!p.containment_available);
+        assert_eq!(p.policy().decision(), Decision::Deny);
+        assert!(p.policy().reasons().contains(&ReasonCode::UnsupportedOs));
+        assert!(!p.containment_available());
     }
 }

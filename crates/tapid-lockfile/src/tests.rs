@@ -1,11 +1,240 @@
-use super::{LockedPackage, Lockfile, VERSION};
-use std::str::FromStr;
-use tapid_core::{ArtifactDigest, PackageName, PackageVersion};
+use super::{LocalWorkspaceSource, LockedPackage, LockedWorkspacePackage, Lockfile};
+use proptest::prelude::*;
 
 #[test]
-fn version_is_present() {
-    assert!(!VERSION.is_empty());
+fn lifecycle_derived_outputs_require_schema_9_and_preserve_source_identity() {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lock = Lockfile::new(&format!("sha256-{}", "a".repeat(64))).unwrap();
+    lock.insert_package(package).unwrap();
+    lock.set_roots([key.clone()]).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&lock.to_json().unwrap()).unwrap();
+    value["lockfileVersion"] = 9.into();
+    value["packages"][&key]["derivedHooks"] = serde_json::json!([{
+        "attestation":format!("hmac-sha256-{}", "e".repeat(64)), "hook":"postinstall", "key":format!("sha256-{}", "c".repeat(64)),
+        "treeDigest":format!("sha256-{}", "d".repeat(64))
+    }]);
+    let parsed = Lockfile::from_json(&value.to_string()).unwrap();
+    let roundtrip: serde_json::Value = serde_json::from_str(&parsed.to_json().unwrap()).unwrap();
+    assert_eq!(
+        roundtrip["packages"][&key]["derivedHooks"],
+        value["packages"][&key]["derivedHooks"]
+    );
+    assert_eq!(
+        roundtrip["packages"][&key]["treeDigest"],
+        value["packages"][&key]["treeDigest"]
+    );
+    for version in [7, 8] {
+        value["lockfileVersion"] = version.into();
+        assert!(Lockfile::from_json(&value.to_string()).is_err());
+    }
 }
+
+#[test]
+fn local_workspace_source_has_a_canonical_identity_and_rejects_escape_paths() {
+    let source = LocalWorkspaceSource::new("packages/web", "@tapid/web", "1.2.3").unwrap();
+
+    assert_eq!(source.identity(), "workspace:packages/web:@tapid/web@1.2.3");
+    assert_eq!(
+        source,
+        "workspace:packages/web:@tapid/web@1.2.3".parse().unwrap()
+    );
+    assert!(LocalWorkspaceSource::new("../outside", "@tapid/web", "1.2.3").is_err());
+    assert!(LocalWorkspaceSource::new("packages/with|separator", "@tapid/web", "1.2.3").is_err());
+}
+
+#[test]
+fn workspace_dependency_cycles_roundtrip_without_registry_identity() {
+    let mut first = LockedWorkspacePackage::new(
+        LocalWorkspaceSource::new("packages/first", "first", "1.0.0").unwrap(),
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let mut second = LockedWorkspacePackage::new(
+        LocalWorkspaceSource::new("packages/second", "second", "1.0.0").unwrap(),
+        "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    )
+    .unwrap();
+    first.add_dependency("second", &second.key()).unwrap();
+    second.add_dependency("first", &first.key()).unwrap();
+    let first_key = first.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_graph([], [first, second]).unwrap();
+    lockfile.set_roots([first_key.clone()]).unwrap();
+
+    let serialized = lockfile.to_json().unwrap();
+    let replayed = Lockfile::from_json(&serialized).unwrap();
+    assert_eq!(replayed.to_json().unwrap(), serialized);
+    assert_eq!(
+        replayed.workspace_packages()[&first_key]
+            .dependencies()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn workspace_package_lock_identity_roundtrips_roots_and_dependency_edges() {
+    let source = LocalWorkspaceSource::new("packages/web", "@tapid/web", "1.2.3").unwrap();
+    let workspace = LockedWorkspacePackage::new(
+        source.clone(),
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let workspace_key = workspace.key();
+    let mut consumer = package_fixture();
+    consumer
+        .add_dependency("@tapid/web", &workspace_key)
+        .unwrap();
+    let consumer_key = consumer.key();
+
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_workspace_package(workspace).unwrap();
+    lockfile.insert_package(consumer).unwrap();
+    lockfile.set_roots([workspace_key.clone()]).unwrap();
+
+    let json = lockfile.to_json().unwrap();
+    assert!(json.contains("workspacePackages"));
+    let replayed = Lockfile::from_json(&json).unwrap();
+    assert_eq!(replayed.roots(), std::slice::from_ref(&workspace_key));
+    assert_eq!(
+        replayed.packages()[&consumer_key].dependencies()["@tapid/web"],
+        workspace_key
+    );
+    assert_eq!(replayed.to_json().unwrap(), json);
+}
+
+#[test]
+fn local_workspace_source_serialization_revalidates_the_canonical_path() {
+    let source = LocalWorkspaceSource::new("packages/web", "@tapid/web", "1.2.3").unwrap();
+    let json = serde_json::to_string(&source).unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<LocalWorkspaceSource>(&json).unwrap(),
+        source
+    );
+    assert!(
+        serde_json::from_str::<LocalWorkspaceSource>(
+            r#"{"path":"../outside","name":"@tapid/web","version":"1.2.3"}"#
+        )
+        .is_err()
+    );
+}
+#[test]
+fn old_main_registry_identity_requires_explicit_recovery() {
+    // Produced and round-tripped by pre-canonicalization main (3d5f97c).
+    let input = include_str!("../tests/fixtures/legacy-registry.lock");
+    let error = Lockfile::from_json(input).unwrap_err().to_string();
+    assert!(
+        error.contains("noncanonical persisted registry identity"),
+        "{error}"
+    );
+    assert!(error.contains("backup"), "{error}");
+    assert!(error.contains("online"), "{error}");
+    assert!(error.contains("--offline"), "{error}");
+    assert!(error.contains("--frozen"), "{error}");
+}
+
+#[test]
+fn persisted_registry_spellings_fail_closed_at_every_identity_boundary() {
+    let old = include_str!("../tests/fixtures/legacy-registry.lock");
+    let canonical = old.replace(
+        "https://REGISTRY.example.test:443",
+        "https://registry.example.test",
+    );
+    let base: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    let key = base["roots"][0].as_str().unwrap();
+    assert!(Lockfile::from_json(&canonical).is_ok());
+    for origin in [
+        "https://REGISTRY.example.test",
+        "https://registry.example.test:443",
+        "https://registry.example.test/",
+        "https://REGISTRY.example.test:443",
+    ] {
+        let alternate = key.replacen("https://registry.example.test", origin, 1);
+        for boundary in ["package", "key", "root", "edge", "collision", "schema4"] {
+            let mut value = base.clone();
+            match boundary {
+                "package" => value["packages"][key]["registry"] = origin.into(),
+                "key" | "schema4" => {
+                    let mut package = value["packages"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(key)
+                        .unwrap();
+                    if boundary == "schema4" {
+                        package["registry"] = origin.into();
+                    }
+                    value["packages"][&alternate] = package;
+                    value["roots"] = serde_json::json!([]);
+                    value["lockfileVersion"] = 4.into();
+                }
+                "root" => value["roots"] = serde_json::json!([alternate]),
+                "edge" => value["packages"][key]["dependencies"]["demo"] = alternate.clone().into(),
+                "collision" => {
+                    let mut package = value["packages"][key].clone();
+                    package["registry"] = origin.into();
+                    package["treeDigest"] = format!("sha256-{}", "c".repeat(64)).into();
+                    value["packages"][&alternate] = package;
+                }
+                _ => unreachable!(),
+            }
+            let error = Lockfile::from_json(&value.to_string()).unwrap_err();
+            assert!(
+                matches!(error, super::LockfileError::NonCanonicalRegistryIdentity),
+                "{origin} {boundary}: {error}"
+            );
+        }
+        assert!(matches!(
+            alternate.parse::<super::LockfilePackageKey>(),
+            Err(super::LockfileError::NonCanonicalRegistryIdentity)
+        ));
+    }
+}
+
+#[test]
+fn legacy_registry_recovery_does_not_accept_credentials_or_paths() {
+    let old = include_str!("../tests/fixtures/legacy-registry.lock");
+    for origin in [
+        "https://user:secret@registry.example.test",
+        "https://@registry.example.test",
+        "https://registry.example.test/private",
+        "https://registry.example.test?token=secret",
+        "https://registry.example.test#secret",
+    ] {
+        let input = old.replace("https://REGISTRY.example.test:443", origin);
+        assert!(
+            matches!(
+                Lockfile::from_json(&input),
+                Err(super::LockfileError::Domain(_))
+            ),
+            "{origin}"
+        );
+    }
+}
+
+fn declared_package(
+    registry: &str,
+    name: &str,
+    version: &str,
+    artifact_integrity: &str,
+    unpacked_digest: &str,
+) -> Result<LockedPackage, super::LockfileError> {
+    LockedPackage::new_with_provenance(
+        registry,
+        name,
+        version,
+        artifact_integrity,
+        unpacked_digest,
+        super::RegistryIntegrityProvenance::RegistryDeclared,
+    )
+}
+use std::str::FromStr;
+use tapid_core::{ArtifactDigest, PackageName, PackageVersion};
 
 #[test]
 fn serializes_packages_in_canonical_order() {
@@ -14,7 +243,7 @@ fn serializes_packages_in_canonical_order() {
             .unwrap();
     lockfile
         .insert_package(
-            LockedPackage::new(
+            declared_package(
                 "https://registry.example.test",
                 "@tapid/core",
                 "1.0.0",
@@ -26,20 +255,86 @@ fn serializes_packages_in_canonical_order() {
         .unwrap();
     lockfile
         .insert_package(
-            LockedPackage::new(
+            declared_package(
                 "https://registry.example.test",
                 "alpha",
                 "1.0.0",
-                &format!("sha512-{}", "C".repeat(86)),
+                "sha512-ndzQj2/g3boQWYtZQd+xKkW0TfhrPjTperEStZq/VaKgGIw/wMEZ9DsrhO9Yo/BpUtwv0kArKxmAWfv+FVKoPg==",
                 "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             )
             .unwrap(),
         )
         .unwrap();
 
+    let roots = lockfile.packages().keys().cloned().collect::<Vec<_>>();
+    lockfile.set_roots(roots).unwrap();
     let json = lockfile.to_json().unwrap();
     assert!(json.find("@tapid/core@1.0.0").unwrap() < json.find("alpha@1.0.0").unwrap());
     assert_eq!(Lockfile::from_json(&json).unwrap(), lockfile);
+}
+
+#[test]
+fn schema_6_serializes_registry_integrity_provenance() {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key.clone()]).unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&lockfile.to_json().unwrap()).unwrap();
+
+    assert_eq!(
+        json["packages"][key]["registryIntegrityDeclared"],
+        serde_json::Value::Bool(true)
+    );
+}
+
+#[test]
+fn schema_6_rejects_missing_registry_integrity_provenance() {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key.clone()]).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&lockfile.to_json().unwrap()).unwrap();
+    json["packages"][&key]
+        .as_object_mut()
+        .unwrap()
+        .remove("registryIntegrityDeclared");
+
+    assert!(matches!(
+        Lockfile::from_json(&serde_json::to_string(&json).unwrap()),
+        Err(super::LockfileError::MissingRegistryIntegrityProvenance(package))
+            if package == key
+    ));
+}
+
+#[test]
+fn replay_rejects_locally_computed_registry_integrity() {
+    let package = LockedPackage::new_with_provenance(
+        "https://registry.npmjs.org",
+        "demo",
+        "1.0.0",
+        "sha512-ndzQj2/g3boQWYtZQd+xKkW0TfhrPjTperEStZq/VaKgGIw/wMEZ9DsrhO9Yo/BpUtwv0kArKxmAWfv+FVKoPg==",
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        super::RegistryIntegrityProvenance::LocallyComputed,
+    )
+    .unwrap();
+    let key = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key.clone()]).unwrap();
+
+    assert!(matches!(
+        lockfile.validate_replay(lockfile.root_manifest_digest()),
+        Err(super::LockfileError::UnverifiedRegistryArtifact(package)) if package == key
+    ));
 }
 
 #[test]
@@ -47,7 +342,7 @@ fn rejects_machine_specific_or_secret_values() {
     let mut lockfile =
         Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap();
-    let mut package = LockedPackage::new(
+    let mut package = declared_package(
         "https://registry.example.test",
         "tapid",
         "1.0.0",
@@ -78,23 +373,44 @@ fn constructors_validate_domain_values() {
 }
 
 #[test]
-fn preserves_case_sensitive_sha512_integrity_values() {
-    let integrity = format!("sha512-{}", "AbCdEfGh".repeat(10) + "AbCdEf");
+fn deserialized_integrity_must_use_canonical_padded_base64() {
+    let package = package_fixture();
+    let key = package.key();
     let mut lockfile =
         Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap();
-    lockfile
-        .insert_package(
-            LockedPackage::new(
-                "https://registry.example.test",
-                "tapid",
-                "1.0.0",
-                &integrity,
-                "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            )
-            .unwrap(),
-        )
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key.clone()]).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&lockfile.to_json().unwrap()).unwrap();
+    let canonical = json["packages"][&key]["artifactIntegrity"]
+        .as_str()
         .unwrap();
+    assert!(canonical.ends_with("=="));
+    json["packages"][&key]["artifactIntegrity"] = canonical.trim_end_matches('=').into();
+
+    assert!(matches!(
+        Lockfile::from_json(&serde_json::to_string(&json).unwrap()),
+        Err(super::LockfileError::InvalidSha512(_))
+    ));
+}
+
+#[test]
+fn preserves_case_sensitive_sha512_integrity_values() {
+    let integrity = "sha512-vjezHzaHfTgpmqTTye2FWJ751nFdp6l4EtqfRsd2sylZY73USlHKS75q67jhw5cb7uMi0xRAdd1MiTHAfaR9TA==".to_owned();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    let package = declared_package(
+        "https://registry.example.test",
+        "tapid",
+        "1.0.0",
+        &integrity,
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let root = package.key();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([root]).unwrap();
     assert!(lockfile.to_json().unwrap().contains(&integrity));
 }
 
@@ -115,13 +431,172 @@ fn replay_validation_requires_current_root_manifest_digest() {
 }
 
 #[test]
+fn replay_validation_accepts_uppercase_root_manifest_digest() {
+    let lowercase = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let uppercase = format!("sha256-{}", lowercase[7..].to_uppercase());
+    let lock_json = format!(
+        r#"{{"lockfileVersion":4,"rootManifestDigest":"{uppercase}","resolverVersion":"0","linkerVersion":"0","packages":{{}}}}"#
+    );
+    let lock = Lockfile::from_json(&lock_json).unwrap();
+    assert!(lock.validate_replay(lowercase).is_ok());
+}
+
+#[test]
+fn provenance_uses_schema_7_while_v4_and_v6_remain_readable() {
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    let package = package_fixture();
+    lockfile.insert_package(package.clone()).unwrap();
+    assert!(matches!(
+        lockfile.to_json(),
+        Err(super::LockfileError::MissingRoots)
+    ));
+    lockfile.set_roots([package.key()]).unwrap();
+    let current = lockfile.to_json().unwrap();
+    let mut current_value: serde_json::Value = serde_json::from_str(&current).unwrap();
+    assert_eq!(current_value["lockfileVersion"], 7);
+    let mut schema_six = current_value.clone();
+    schema_six["lockfileVersion"] = 6.into();
+    assert!(Lockfile::from_json(&serde_json::to_string(&schema_six).unwrap()).is_ok());
+
+    let mut rootless_current = current_value.clone();
+    rootless_current.as_object_mut().unwrap().remove("roots");
+    assert!(matches!(
+        Lockfile::from_json(&serde_json::to_string(&rootless_current).unwrap()),
+        Err(super::LockfileError::MissingRoots)
+    ));
+
+    current_value["lockfileVersion"] = 4.into();
+    current_value.as_object_mut().unwrap().remove("roots");
+    assert!(Lockfile::from_json(&serde_json::to_string(&current_value).unwrap()).is_ok());
+}
+
+#[test]
+fn schema_5_requires_regeneration_before_replay() {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key]).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&lockfile.to_json().unwrap()).unwrap();
+    json["lockfileVersion"] = 5.into();
+    for package in json["packages"].as_object_mut().unwrap().values_mut() {
+        package
+            .as_object_mut()
+            .unwrap()
+            .remove("registryIntegrityDeclared");
+    }
+
+    let legacy = Lockfile::from_json(&serde_json::to_string(&json).unwrap()).unwrap();
+    assert!(matches!(
+        legacy.validate_replay(legacy.root_manifest_digest()),
+        Err(super::LockfileError::RegenerationRequired(5))
+    ));
+}
+
+#[test]
+fn deserialized_roots_must_be_unique_sorted_and_semantically_canonical() {
+    let first = package_fixture();
+    let second = declared_package(
+        "https://registry.npmjs.org",
+        "zeta",
+        "2.0.0",
+        "sha512-/MmRN7JJVA+b2CiofaMX879ymjOivjQ16Qn+6w0HmmDrfj4VpVRxN2knDRCdgZqbH/2lm5jnuaEgVL1lWkTCAQ==",
+        "sha256-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    )
+    .unwrap();
+    let first_key = first.key();
+    let second_key = second.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_packages([first, second]).unwrap();
+    lockfile
+        .set_roots([first_key.clone(), second_key.clone()])
+        .unwrap();
+    let canonical = lockfile.to_json().unwrap();
+    assert_eq!(
+        Lockfile::from_json(&canonical).unwrap().to_json().unwrap(),
+        canonical
+    );
+
+    let mut duplicate: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    duplicate["roots"] = serde_json::json!([first_key, first_key]);
+    assert!(matches!(
+        Lockfile::from_json(&serde_json::to_string(&duplicate).unwrap()),
+        Err(super::LockfileError::NonCanonicalRoots)
+    ));
+
+    let mut unordered: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    unordered["roots"] = serde_json::json!([second_key, first_key]);
+    assert!(matches!(
+        Lockfile::from_json(&serde_json::to_string(&unordered).unwrap()),
+        Err(super::LockfileError::NonCanonicalRoots)
+    ));
+
+    assert!(matches!(
+        "https://registry.example.test|demo@1.0.0|peer=not-a-context|platform=-"
+            .parse::<super::LockfilePackageKey>(),
+        Err(super::LockfileError::InvalidPackageKey(_))
+    ));
+}
+
+#[test]
+fn exact_root_package_keys_roundtrip_and_cannot_dangle() {
+    let package = package_fixture();
+    let root = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([root.clone()]).unwrap();
+
+    let replayed = Lockfile::from_json(&lockfile.to_json().unwrap()).unwrap();
+    assert_eq!(replayed.roots(), &[root]);
+    assert!(matches!(
+        lockfile.set_roots(["https://registry.npmjs.org|missing@1.0.0|peer=-|platform=-"]),
+        Err(super::LockfileError::DanglingRoot(_))
+    ));
+}
+
+#[test]
+fn accepts_scoped_https_artifact_paths_without_allowing_credentials() {
+    let mut package = package_fixture();
+    package
+        .set_artifact_url("https://registry.npmjs.org/@alloc/quick-lru/-/quick-lru-5.2.0.tgz")
+        .unwrap();
+    package
+        .set_artifact_url("https://registry.npmjs.org/@alloc%2Fquick-lru/package.tgz")
+        .unwrap();
+
+    for unsafe_url in [
+        "https://user:secret@registry.npmjs.org/package.tgz",
+        "HTTPS://@registry.npmjs.org/package.tgz",
+        "https://registry.npmjs.org/package.tgz?token=secret",
+        "https://registry.npmjs.org/package.tgz#fragment",
+        "https://REGISTRY.npmjs.org/package.tgz",
+        "https://registry.npmjs.org:443/package.tgz",
+        "https://registry.npmjs.org/%7Euser/package.tgz",
+        "https://registry.npmjs.org/@alloc%2fquick-lru/package.tgz",
+    ] {
+        assert!(
+            package.set_artifact_url(unsafe_url).is_err(),
+            "accepted {unsafe_url}"
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_artifact_urls_at_construction_time() {
     let mut package = package_fixture();
     assert!(package.set_artifact_url("file:///tmp/package.tgz").is_err());
 }
 
 fn package_fixture() -> LockedPackage {
-    LockedPackage::new(
+    declared_package(
         "https://registry.example.test",
         "tapid",
         "1.0.0",
@@ -132,6 +607,205 @@ fn package_fixture() -> LockedPackage {
 }
 
 #[test]
+fn alias_bindings_round_trip_and_reject_mismatched_or_legacy_metadata() {
+    let child = package_fixture();
+    let child_key = child.key();
+    let mut parent = declared_package(
+        "https://registry.example.test",
+        "parent",
+        "1.0.0",
+        &format!("sha512-{}", "A".repeat(86)),
+        &format!("sha256-{}", "b".repeat(64)),
+    )
+    .unwrap();
+    parent.add_alias_dependency("local", &child_key).unwrap();
+    let parent_key = parent.key();
+    let mut lock = Lockfile::new(&format!("sha256-{}", "a".repeat(64))).unwrap();
+    lock.insert_packages([parent, child]).unwrap();
+    lock.set_roots([&parent_key, &child_key]).unwrap();
+    lock.set_root_bindings(std::collections::BTreeMap::from([
+        ("parent".into(), parent_key.clone()),
+        ("first".into(), child_key.clone()),
+        ("second".into(), child_key.clone()),
+    ]))
+    .unwrap();
+    let json = lock.to_json().unwrap();
+    assert_eq!(Lockfile::from_json(&json).unwrap(), lock);
+    let base: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for corruption in [
+        "target",
+        "missing",
+        "orphan",
+        "legacy",
+        "unsafe-name",
+        "root-target",
+    ] {
+        let mut value = base.clone();
+        match corruption {
+            "target" => {
+                value["packages"][&parent_key]["dependencyAliases"]["local"] = "other".into()
+            }
+            "missing" => {
+                value["packages"][&parent_key]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependencyAliases");
+            }
+            "orphan" => {
+                value["packages"][&parent_key]["dependencyAliases"]["orphan"] = "tapid".into()
+            }
+            "legacy" => value["lockfileVersion"] = 6.into(),
+            "unsafe-name" => value["rootBindings"]["../outside"] = child_key.clone().into(),
+            "root-target" => value["rootBindings"]["first"] = "not-a-key".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            Lockfile::from_json(&value.to_string()).is_err(),
+            "{corruption}"
+        );
+    }
+}
+
+#[test]
+fn legacy_schema_serialization_rejects_alias_metadata_added_through_public_apis() {
+    let child = package_fixture();
+    let child_key = child.key();
+    let mut base = Lockfile::new(&format!("sha256-{}", "a".repeat(64))).unwrap();
+    base.insert_package(child).unwrap();
+    base.set_roots([&child_key]).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&base.to_json().unwrap()).unwrap();
+    for version in [4, 5, 6] {
+        value["lockfileVersion"] = version.into();
+        let legacy = Lockfile::from_json(&value.to_string()).unwrap();
+        assert_eq!(
+            Lockfile::from_json(&legacy.to_json().unwrap()).unwrap(),
+            legacy
+        );
+
+        let mut roots = legacy.clone();
+        roots
+            .set_root_bindings(std::collections::BTreeMap::from([(
+                "local".into(),
+                child_key.clone(),
+            )]))
+            .unwrap();
+        assert!(
+            matches!(roots.to_json(), Err(super::LockfileError::AliasMetadataInLegacySchema(v)) if v == version)
+        );
+
+        let mut edges = legacy;
+        let mut parent = declared_package(
+            "https://registry.example.test",
+            "parent",
+            "1.0.0",
+            &format!("sha512-{}", "A".repeat(86)),
+            &format!("sha256-{}", "b".repeat(64)),
+        )
+        .unwrap();
+        parent.add_alias_dependency("local", &child_key).unwrap();
+        edges.insert_packages([parent]).unwrap();
+        assert!(
+            matches!(edges.to_json(), Err(super::LockfileError::AliasMetadataInLegacySchema(v)) if v == version)
+        );
+    }
+}
+
+#[test]
+fn schema_6_without_aliases_remains_replayable() {
+    let package = package_fixture();
+    let key = package.key();
+    let digest = format!("sha256-{}", "a".repeat(64));
+    let mut lock = Lockfile::new(&digest).unwrap();
+    lock.insert_package(package).unwrap();
+    lock.set_roots([key]).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&lock.to_json().unwrap()).unwrap();
+    value["lockfileVersion"] = 6.into();
+    let legacy = Lockfile::from_json(&value.to_string()).unwrap();
+    legacy.validate_replay(&digest).unwrap();
+    assert!(legacy.to_json().is_ok());
+    let key = legacy.roots()[0].clone();
+    value["packages"][&key]
+        .as_object_mut()
+        .unwrap()
+        .remove("registryIntegrityDeclared");
+    assert!(Lockfile::from_json(&value.to_string()).is_err());
+}
+
+fn malformed_package_field_error(field: &str, value: &str) -> super::LockfileError {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lockfile =
+        Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    lockfile.insert_package(package).unwrap();
+    lockfile.set_roots([key.clone()]).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&lockfile.to_json().unwrap()).unwrap();
+    json["packages"][&key][field] = value.into();
+
+    Lockfile::from_json(&serde_json::to_string(&json).unwrap()).unwrap_err()
+}
+
+#[test]
+fn malformed_nested_registry_returns_a_domain_error() {
+    assert!(matches!(
+        malformed_package_field_error("registry", "http://registry.example.test"),
+        super::LockfileError::Domain(_)
+    ));
+}
+
+#[test]
+fn malformed_nested_package_name_returns_a_domain_error() {
+    assert!(matches!(
+        malformed_package_field_error("name", "../escape"),
+        super::LockfileError::Domain(_)
+    ));
+}
+
+#[test]
+fn malformed_nested_package_version_returns_a_domain_error() {
+    assert!(matches!(
+        malformed_package_field_error("version", "not-semver"),
+        super::LockfileError::Domain(_)
+    ));
+}
+
+#[test]
+fn inserts_mutually_dependent_packages_as_one_batch() {
+    let digest = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let integrity = format!("sha512-{}", "A".repeat(86));
+    let mut first = declared_package(
+        "https://registry.example.com",
+        "first",
+        "1.0.0",
+        &integrity,
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let mut second = declared_package(
+        "https://registry.example.com",
+        "second",
+        "1.0.0",
+        &integrity,
+        "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    )
+    .unwrap();
+    let first_key = first.key();
+    let second_key = second.key();
+    first.add_dependency("second", &second_key).unwrap();
+    second.add_dependency("first", &first_key).unwrap();
+
+    let mut lockfile = Lockfile::new(digest).unwrap();
+    lockfile.insert_packages([first, second]).unwrap();
+    lockfile.set_roots([first_key]).unwrap();
+
+    assert_eq!(lockfile.packages().len(), 2);
+    assert_eq!(
+        Lockfile::from_json(&lockfile.to_json().unwrap()).unwrap(),
+        lockfile
+    );
+}
+
+#[test]
 fn same_name_and_version_from_two_registries_are_distinct() {
     let mut lockfile =
         Lockfile::new("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -139,7 +813,7 @@ fn same_name_and_version_from_two_registries_are_distinct() {
     for registry in ["https://one.example", "https://two.example"] {
         lockfile
             .insert_package(
-                LockedPackage::new(
+                declared_package(
                     registry,
                     "tapid",
                     "1.0.0",
@@ -159,24 +833,117 @@ fn peer_and_platform_contexts_change_key_deterministically() {
         .with("react".parse().unwrap(), "18.2.0".parse().unwrap());
     let platform =
         tapid_core::PlatformContext::new(Some("linux"), Some("x86_64"), Some("gnu")).unwrap();
-    let package = LockedPackage::new_with_context(
+    let package = LockedPackage::new_with_context_and_provenance(
         "https://registry.example.test",
         "tapid",
         "1.0.0",
         &format!("sha512-{}", "A".repeat(86)),
         "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        &peer,
-        &platform,
+        (&peer, &platform),
+        super::RegistryIntegrityProvenance::RegistryDeclared,
     )
     .unwrap();
     assert_eq!(
         package.key(),
-        "https://registry.example.test|tapid@1.0.0|peer=react@18.2.0|platform=linux-x86_64-gnu"
+        "https://registry.example.test|tapid@1.0.0|peer=name=react;version=18.2.0|platform=os=linux;cpu=x86_64;libc=gnu"
     );
+}
+
+#[test]
+fn package_key_roundtrips_contexts_without_loss() {
+    let peer = tapid_core::PeerContext::default()
+        .with("foo-bar".parse().unwrap(), "1.2.3".parse().unwrap());
+    let platform = tapid_core::PlatformContext::new(
+        Some("linux-gnu"),
+        Some("x86_64-unknown"),
+        Some("musl-extra"),
+    )
+    .unwrap();
+    let package = LockedPackage::new_with_context_and_provenance(
+        "https://registry.example.test",
+        "tapid",
+        "1.0.0",
+        &format!("sha512-{}", "A".repeat(86)),
+        "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        (&peer, &platform),
+        super::RegistryIntegrityProvenance::RegistryDeclared,
+    )
+    .unwrap();
+    let key = package.key();
+    let parsed = key.parse::<super::LockfilePackageKey>().unwrap();
+    assert_eq!(parsed.to_string(), key);
+    assert!(key.contains("foo%2Dbar"));
+    assert!(key.contains("linux%2Dgnu"));
+    assert!(key.contains("x86_64%2Dunknown"));
+    assert!(key.contains("musl%2Dextra"));
+}
+
+#[test]
+fn package_key_distinguishes_platform_component_boundaries() {
+    let first = tapid_core::PlatformContext::new(Some("linux"), Some("x86_64"), None).unwrap();
+    let second = tapid_core::PlatformContext::new(Some("linux"), None, Some("x86_64")).unwrap();
+    let make = |platform: &tapid_core::PlatformContext| {
+        LockedPackage::new_with_context_and_provenance(
+            "https://registry.example.test",
+            "tapid",
+            "1.0.0",
+            &format!("sha512-{}", "A".repeat(86)),
+            "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            (&tapid_core::PeerContext::default(), platform),
+            super::RegistryIntegrityProvenance::RegistryDeclared,
+        )
+        .unwrap()
+    };
+    assert_ne!(make(&first).key(), make(&second).key());
+}
+
+proptest! {
+    #[test]
+    fn generated_package_keys_roundtrip_without_changing_identity(
+        package_number in 0u32..1000, peer_count in 0usize..4,
+        os in prop::option::of(prop::sample::select(vec!["linux", "darwin", "windows"])),
+        cpu in prop::option::of(prop::sample::select(vec!["x86_64", "aarch64"])),
+        libc in prop::option::of(prop::sample::select(vec!["gnu", "musl"])),
+    ) {
+        let peer = (0..peer_count).fold(tapid_core::PeerContext::default(), |context, index| {
+            context.with(format!("peer-{index}").parse().unwrap(), format!("1.{index}.0").parse().unwrap())
+        });
+        let platform = tapid_core::PlatformContext::new(os, cpu, libc).unwrap();
+        let package = LockedPackage::new_with_context_and_provenance(
+            "https://registry.example.test", &format!("pkg-{package_number}"), "1.0.0",
+            &format!("sha512-{}", "A".repeat(86)),
+            "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            (&peer, &platform), super::RegistryIntegrityProvenance::RegistryDeclared,
+        ).unwrap();
+        let key = package.key();
+        prop_assert_eq!(key.parse::<super::LockfilePackageKey>().unwrap().to_string(), key);
+    }
 }
 
 #[test]
 fn lockfile_v1_is_not_implicitly_accepted() {
     let input = r#"{"lockfileVersion":1,"rootManifestDigest":"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resolverVersion":"0","linkerVersion":"0","packages":{}}"#;
     assert!(Lockfile::from_json(input).is_err());
+}
+
+#[test]
+fn lifecycle_outputs_reject_forged_or_unordered_records() {
+    let package = package_fixture();
+    let key = package.key();
+    let mut lock = Lockfile::new(&format!("sha256-{}", "a".repeat(64))).unwrap();
+    lock.insert_package(package).unwrap();
+    lock.set_roots([key.clone()]).unwrap();
+    let output = |hook: &str| serde_json::json!({"attestation":format!("hmac-sha256-{}", "e".repeat(64)),"hook":hook,"key":format!("sha256-{}", "b".repeat(64)),"treeDigest":format!("sha256-{}", "c".repeat(64))});
+    for records in [
+        serde_json::json!([output("prepare")]),
+        serde_json::json!([output("install"), output("install")]),
+        serde_json::json!([output("postinstall"), output("preinstall")]),
+        serde_json::json!([{"hook":"install","key":"sha256-INVALID","treeDigest":"sha256-INVALID"}]),
+        serde_json::json!([{"hook":"install","key":format!("sha256-{}", "b".repeat(64)),"treeDigest":format!("sha256-{}", "c".repeat(64)),"trusted":true}]),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(&lock.to_json().unwrap()).unwrap();
+        value["lockfileVersion"] = 9.into();
+        value["packages"][&key]["derivedHooks"] = records;
+        assert!(Lockfile::from_json(&value.to_string()).is_err());
+    }
 }
