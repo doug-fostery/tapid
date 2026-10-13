@@ -81,11 +81,11 @@ fn execute(
         Ok(summary) => {
             println!("Package cache: {}", root.display());
             println!(
-                "Artifacts: {} entries, {} bytes",
+                "Artifacts: {} entries, {} logical bytes",
                 summary.artifacts.entries, summary.artifacts.bytes
             );
             println!(
-                "Trees: {} entries, {} bytes",
+                "Trees: {} entries, {} logical bytes",
                 summary.trees.entries, summary.trees.bytes
             );
             println!(
@@ -112,7 +112,7 @@ fn execute(
             eprintln!("error: {error}");
             if matches!(error, tapid_store::IngestError::CacheCleanup(_)) {
                 eprintln!(
-                    "Some cache entries may already have been removed. Inspection and retry are safe."
+                    "Cache cleanup stopped; some entries may have been removed. Inspect or retry to finish. Tapid does not schedule background cleanup."
                 );
             }
             ExitCode::from(1)

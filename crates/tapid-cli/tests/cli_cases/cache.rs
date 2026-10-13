@@ -22,7 +22,7 @@ fn cache_inspection_and_clean_preview_preserve_bytes_until_yes() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("11 bytes"), "{text}");
+        assert!(text.contains("11 logical bytes"), "{text}");
         assert!(artifact.exists());
     }
     let output = Command::new(env!("CARGO_BIN_EXE_tapid"))
@@ -244,4 +244,44 @@ fn cache_json_pending_recovery_has_operation_phase() {
         fs::read(store.join(".tapid-transaction.json")).unwrap(),
         b"pending"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_cleanup_failure_gives_manual_recovery_advice_and_nonzero_json_state() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let home = TempHome::new("cache-cleanup-failure").unwrap();
+    let store = home.path().join("store");
+    let digest = format!("sha256-{}", "a".repeat(64));
+    let artifacts = store.join("artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::write(artifacts.join(digest), b"cached").unwrap();
+    fs::write(store.join(".store.lock"), b"").unwrap();
+    let original = fs::metadata(&artifacts).unwrap().permissions();
+    fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tapid"))
+        .args(["clean", "--yes", "--store-dir"])
+        .arg(&store)
+        .output()
+        .unwrap();
+    fs::set_permissions(&artifacts, original.clone()).unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cache cleanup stopped"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not schedule background cleanup")
+    );
+    assert!(fs::read_dir(&artifacts).unwrap().next().is_some());
+    fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o500)).unwrap();
+    let json_output = Command::new(env!("CARGO_BIN_EXE_tapid"))
+        .args(["--json", "clean", "--yes", "--store-dir"])
+        .arg(&store)
+        .output()
+        .unwrap();
+    fs::set_permissions(&artifacts, original).unwrap();
+    assert!(!json_output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(value["changes"]["state"], "committed_cleanup_pending");
 }
