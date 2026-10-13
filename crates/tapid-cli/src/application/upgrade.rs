@@ -1,0 +1,1026 @@
+use crate::transport::release;
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+use tapid_release_client::{
+    Error as ReleaseError, Fetcher, ReleaseState, accept_release, read_release_state,
+    write_release_state,
+};
+use tapid_signatures::KeyRing;
+
+fn stable_discovery_endpoints(endpoint_args: &[String], env_value: Option<&str>) -> Vec<String> {
+    if !endpoint_args.is_empty() {
+        return endpoint_args.to_vec();
+    }
+    if let Some(value) = env_value {
+        let endpoints: Vec<String> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !endpoints.is_empty() {
+            return endpoints;
+        }
+    }
+    Vec::new()
+}
+
+pub(crate) fn run(
+    endpoint_args: &[String],
+    release_url_arg: Option<&str>,
+    keyring_arg: Option<&Path>,
+    destination_arg: Option<&Path>,
+    dry_run: bool,
+) -> Result<UpgradeReport, String> {
+    let endpoints = stable_discovery_endpoints(
+        endpoint_args,
+        std::env::var("TAPID_STABLE_ENDPOINTS").ok().as_deref(),
+    );
+    let release_url = release_url_arg
+        .map(str::to_owned)
+        .or_else(|| std::env::var("TAPID_RELEASE_RECORD_URL").ok());
+    let keyring_path = keyring_arg
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("TAPID_RELEASE_KEYRING").map(PathBuf::from));
+    if !endpoints.is_empty() && release_url.is_some() {
+        return Err("choose either a release record URL or legacy signed endpoints".into());
+    }
+    let destination = match destination_arg {
+        Some(path) => path.to_owned(),
+        None => match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => return Err(format!("cannot determine current executable: {error}")),
+        },
+    };
+    crate::filesystem::atomic::validate_upgrade_destination(&destination)?;
+    let target = release::release_target();
+    let mut fetcher = release::CurlFetcher;
+
+    let DownloadedRelease {
+        version: manifest_version,
+        artifact_name,
+        bytes,
+        signature_verified,
+        verification_known,
+        recovered,
+    } = if endpoints.is_empty() {
+        let keyring = match keyring_path {
+            Some(path) => KeyRing::from_embedded_json(&fs::read(&path).map_err(|error| {
+                format!(
+                    "cannot read trusted release keyring '{}': {error}",
+                    path.display()
+                )
+            })?)
+            .map_err(|error| format!("invalid trusted release keyring: {error}"))?,
+            None => KeyRing::production()
+                .map_err(|error| format!("invalid embedded keyring: {error}"))?,
+        };
+        download_record_release(
+            &mut fetcher,
+            release_url
+                .as_deref()
+                .unwrap_or(super::release_record::DEFAULT_URL),
+            target,
+            &destination,
+            &keyring,
+        )?
+    } else {
+        let keyring = match keyring_path {
+            Some(path) => KeyRing::from_embedded_json(&fs::read(&path).map_err(|error| {
+                format!(
+                    "cannot read trusted release keyring '{}': {error}",
+                    path.display()
+                )
+            })?)
+            .map_err(|error| format!("invalid trusted release keyring: {error}"))?,
+            None => KeyRing::production()
+                .map_err(|error| format!("invalid embedded keyring: {error}"))?,
+        };
+        download_release(&mut fetcher, &endpoints, &keyring, target, &destination)?
+    };
+    // Fresh installs have no recovery state yet. The running binary is still a
+    // version floor when replacing itself, including an explicit self destination.
+    let current_executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    if fs::canonicalize(&destination).ok() == fs::canonicalize(&current_executable).ok() {
+        let running: tapid_core::PackageVersion = env!("CARGO_PKG_VERSION")
+            .parse()
+            .map_err(|error| format!("invalid running version: {error}"))?;
+        let selected: tapid_core::PackageVersion = manifest_version
+            .parse()
+            .map_err(|error| format!("invalid release version: {error}"))?;
+        if selected < running {
+            return Err(format!(
+                "refusing to downgrade running Tapid {running} to {selected}"
+            ));
+        }
+    }
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let state_path = release_state_path(&destination);
+    let previous_state = if state_path.exists() {
+        Some(
+            read_release_state(&state_path)
+                .map_err(|error| format!("cannot read release state: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let mut state = match &previous_state {
+        Some(previous) => accept_release(
+            previous,
+            &manifest_version,
+            previous.release_sequence.saturating_add(1),
+            digest.clone(),
+        ),
+        None => ReleaseState::new(&manifest_version, 1, digest.clone()),
+    }
+    .map_err(|error| format!("cannot accept verified release state: {error}"))?;
+    state.verification = if !verification_known {
+        "unknown"
+    } else if signature_verified {
+        "signature"
+    } else {
+        "checksum"
+    }
+    .into();
+    let state_changed = previous_state.as_ref().is_none_or(|previous| {
+        previous.last_known_good != state.last_known_good
+            || previous.release_floor != state.release_floor
+            || previous.verification != state.verification
+    });
+    let pending_state = Some((state_path, state, digest));
+
+    let executable = crate::filesystem::atomic::materialize_artifact(&artifact_name, &bytes)?;
+    let already_current = fs::read(&destination)
+        .map_err(|error| format!("cannot read installed executable: {error}"))?
+        == executable;
+    if dry_run {
+        return Ok(UpgradeReport {
+            version: manifest_version,
+            target: target.to_owned(),
+            destination,
+            dry_run: true,
+            signature_verified,
+            verification_known,
+            already_current,
+            recovered,
+        });
+    }
+    if already_current {
+        // A separate installer may have replaced the binary since the last
+        // upgrade. Refresh its recovery state without replacing matching bytes.
+        if let Some((state_path, state, digest)) = pending_state {
+            if state_changed {
+                persist_activated_release(&destination, &state_path, &state, &digest, &bytes)?;
+            } else {
+                // Repair a missing cache while preserving the repeated-check state.
+                write_cached_artifact(&destination, &digest, &bytes)?;
+            }
+        }
+        return Ok(UpgradeReport {
+            version: manifest_version,
+            target: target.to_owned(),
+            destination,
+            dry_run: false,
+            signature_verified,
+            verification_known,
+            already_current,
+            recovered,
+        });
+    }
+    match activate_and_persist(
+        &destination,
+        &executable,
+        pending_state,
+        &bytes,
+        crate::filesystem::atomic::replace_executable,
+    ) {
+        Ok(()) => Ok(UpgradeReport {
+            version: manifest_version,
+            target: target.to_owned(),
+            destination,
+            dry_run: false,
+            signature_verified,
+            verification_known,
+            already_current,
+            recovered,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct DownloadedRelease {
+    version: String,
+    artifact_name: String,
+    bytes: Vec<u8>,
+    signature_verified: bool,
+    verification_known: bool,
+    recovered: bool,
+}
+
+fn download_record_release<F: Fetcher>(
+    fetcher: &mut F,
+    url: &str,
+    target: &str,
+    destination: &Path,
+    keyring: &KeyRing,
+) -> Result<DownloadedRelease, String> {
+    if !super::release_record::https_url(url) {
+        return Err(
+            "release record URL must be HTTPS without credentials, query, or fragment".into(),
+        );
+    }
+    let body = match fetcher.fetch_metadata_with_limit(url, super::release_record::MAX_BYTES) {
+        Ok(body) => body,
+        Err(ReleaseError::Fetch(error)) => {
+            let (version, artifact_name, bytes, signature_verified, verification_known) =
+                recover_last_known_good(destination, target).map_err(|recovery| {
+                    format!("release discovery unavailable ({error}); recovery failed: {recovery}")
+                })?;
+            return Ok(DownloadedRelease {
+                version,
+                artifact_name,
+                bytes,
+                signature_verified,
+                verification_known,
+                recovered: true,
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| format!("cannot determine current time: {error}"))?;
+    let sidecar_url = super::release_record::signature_url(url);
+    let sidecar = match fetcher
+        .fetch_metadata_with_limit(&sidecar_url, super::release_record::MAX_BYTES)
+    {
+        Ok(sidecar) => sidecar,
+        Err(ReleaseError::Fetch(error)) => {
+            let (version, artifact_name, bytes, signature_verified, verification_known) =
+                recover_last_known_good(destination, target).map_err(|recovery| {
+                    format!("release signature unavailable ({error}); recovery failed: {recovery}")
+                })?;
+            return Ok(DownloadedRelease {
+                version,
+                artifact_name,
+                bytes,
+                signature_verified,
+                verification_known,
+                recovered: true,
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    super::release_record::verify_signature(&body, &sidecar, keyring, &now)
+        .map_err(|error| error.to_string())?;
+    let record = super::release_record::parse(&body, target).map_err(|error| error.to_string())?;
+    // A rejected record or download must never become a successful cached upgrade.
+    let bytes = fetcher
+        .fetch_with_limit(&record.url, record.size)
+        .map_err(|error| format!("cannot download release artifact: {error}"))?;
+    if bytes.len() != record.size {
+        return Err(ReleaseError::ArtifactSizeMismatch {
+            expected: record.size as u64,
+            actual: bytes.len() as u64,
+        }
+        .to_string());
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
+        return Err(ReleaseError::ArtifactDigestMismatch.to_string());
+    }
+    Ok(DownloadedRelease {
+        version: record.version,
+        artifact_name: record.name,
+        bytes,
+        signature_verified: true,
+        verification_known: true,
+        recovered: false,
+    })
+}
+
+/// Select signed discovery, outage fallback, or recovery without masking validation errors.
+fn download_release<F: Fetcher>(
+    fetcher: &mut F,
+    endpoints: &[String],
+    keyring: &KeyRing,
+    target: &str,
+    destination: &Path,
+) -> Result<DownloadedRelease, String> {
+    let mut recovered = false;
+    let (version, artifact_name, bytes, signature_verified, verification_known) =
+        match fetch_verified_release(fetcher, endpoints, keyring, target) {
+            Ok(value) => {
+                let name = value
+                    .0
+                    .artifact()
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default();
+                (value.0.version, name, value.1, true, true)
+            }
+            Err(ReleaseError::AllEndpointsFailed { .. }) => {
+                match recover_last_known_good(destination, target) {
+                    Ok(value) => {
+                        recovered = true;
+                        value
+                    }
+                    Err(recovery) => {
+                        return Err(format!(
+                            "stable discovery unavailable and recovery failed: {recovery}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+    Ok(DownloadedRelease {
+        version,
+        artifact_name,
+        bytes,
+        signature_verified,
+        verification_known,
+        recovered,
+    })
+}
+
+pub(crate) struct UpgradeReport {
+    pub(crate) version: String,
+    pub(crate) target: String,
+    pub(crate) destination: PathBuf,
+    pub(crate) dry_run: bool,
+    pub(crate) signature_verified: bool,
+    pub(crate) verification_known: bool,
+    pub(crate) already_current: bool,
+    pub(crate) recovered: bool,
+}
+
+#[allow(clippy::collapsible_if)]
+fn activate_and_persist<F>(
+    destination: &Path,
+    executable: &[u8],
+    pending_state: Option<(PathBuf, ReleaseState, String)>,
+    bytes: &[u8],
+    activate: F,
+) -> Result<(), String>
+where
+    F: Fn(&Path, &[u8]) -> Result<(), String>,
+{
+    let previous_executable = fs::read(destination).ok();
+    let previous_state = pending_state
+        .as_ref()
+        .and_then(|(path, _, _)| fs::read(path).ok());
+    activate(destination, executable)
+        .map_err(|error| format!("cannot activate verified artifact: {error}"))?;
+    if let Some((state_path, state, digest)) = pending_state {
+        if let Err(error) =
+            persist_activated_release(destination, &state_path, &state, &digest, bytes)
+        {
+            let rollback = previous_executable
+                .as_deref()
+                .ok_or_else(|| {
+                    "cannot roll back executable: previous executable was unavailable".to_owned()
+                })
+                .and_then(|old| activate(destination, old));
+            let state_rollback = match previous_state {
+                Some(old) => fs::write(&state_path, old).map_err(|e| e.to_string()),
+                None => fs::remove_file(&state_path)
+                    .or_else(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })
+                    .map_err(|e| e.to_string()),
+            };
+            return Err(match (rollback, state_rollback) {
+                (Ok(()), Ok(())) => {
+                    format!("cannot persist last-known-good state; activation rolled back: {error}")
+                }
+                (rollback, state_rollback) => format!(
+                    "cannot persist last-known-good state: {error}; rollback executable={rollback:?}, state={state_rollback:?}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn release_state_path(destination: &Path) -> PathBuf {
+    destination
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(".tapid-release-state.json")
+}
+
+fn cached_artifact_path(destination: &Path, digest: &str) -> PathBuf {
+    destination
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".tapid-release-artifact-{digest}"))
+}
+
+fn persist_activated_release(
+    destination: &Path,
+    state_path: &Path,
+    state: &ReleaseState,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    write_cached_artifact(destination, digest, bytes)?;
+    write_release_state(state_path, state).map_err(|error| error.to_string())?;
+    let _ = prune_cached_artifacts(destination, digest);
+    Ok(())
+}
+
+fn prune_cached_artifacts(destination: &Path, current_digest: &str) -> Result<(), String> {
+    let directory = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(digest) = name.strip_prefix(".tapid-release-artifact-") else {
+            continue;
+        };
+        if digest != current_digest
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            let path = entry.path();
+            if sha256_file(&path).as_deref() == Ok(digest) {
+                fs::remove_file(path).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub(super) fn write_cached_artifact(
+    destination: &Path,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let path = cached_artifact_path(destination, digest);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err("cached artifact must be a regular file".into());
+        }
+        let existing = fs::read(&path).map_err(|error| error.to_string())?;
+        let existing_digest = format!("{:x}", Sha256::digest(&existing));
+        if existing_digest != digest {
+            return Err("cached artifact digest does not match expected digest".into());
+        }
+        return Ok(());
+    }
+    let temp = path.with_file_name(format!(
+        ".tapid-release-artifact-tmp-{}",
+        crate::filesystem::atomic::unique_nonce()
+    ));
+    fs::write(&temp, bytes).map_err(|e| e.to_string())?;
+    fs::rename(&temp, &path).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        e.to_string()
+    })
+}
+
+fn recover_last_known_good(
+    destination: &Path,
+    target: &str,
+) -> Result<(String, String, Vec<u8>, bool, bool), String> {
+    let state = read_release_state(&release_state_path(destination))
+        .map_err(|e| format!("invalid or missing last-known-good state: {e}"))?;
+    let path = cached_artifact_path(destination, &state.last_known_good.artifact_sha256);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|e| format!("cannot inspect cached verified artifact: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("cached artifact must be a regular file".into());
+    }
+    let bytes =
+        fs::read(&path).map_err(|e| format!("cannot read cached verified artifact: {e}"))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != state.last_known_good.artifact_sha256 {
+        return Err("cached artifact digest does not match last-known-good state".into());
+    }
+    let name = format!("tapid-{}-{target}.tar.gz", state.last_known_good.version);
+    Ok((
+        state.last_known_good.version,
+        name,
+        bytes,
+        state.verification == "signature",
+        state.verification != "unknown",
+    ))
+}
+
+fn fetch_verified_release<F: Fetcher>(
+    fetcher: &mut F,
+    endpoints: &[String],
+    keyring: &KeyRing,
+    target: &str,
+) -> Result<(tapid_release_client::ReleaseManifest, Vec<u8>), ReleaseError> {
+    let endpoint_refs: Vec<&str> = endpoints.iter().map(String::as_str).collect();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| ReleaseError::State(format!("cannot determine current time: {e}")))?;
+    let manifest = tapid_release_client::discover(
+        fetcher,
+        &endpoint_refs,
+        keyring,
+        target,
+        &now,
+        Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
+    )?;
+    let artifact = manifest
+        .artifact()
+        .ok_or_else(|| ReleaseError::TargetNotFound(target.into()))?;
+    let max_bytes = usize::try_from(artifact.size)
+        .map_err(|_| ReleaseError::Fetch("artifact is too large for this platform".into()))?;
+    if max_bytes > crate::filesystem::atomic::MAX_ARTIFACT_BYTES {
+        return Err(ReleaseError::Fetch(
+            "artifact exceeds maximum archive size".into(),
+        ));
+    }
+    let bytes = fetcher
+        .fetch_with_limit(&artifact.url, max_bytes)
+        .map_err(ReleaseError::Fetch)?;
+    manifest.verify_artifact(&bytes)?;
+    Ok((manifest, bytes))
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::{persist_activated_release, stable_discovery_endpoints};
+    use crate::filesystem::atomic::materialize_artifact;
+    use sha2::Digest;
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tapid_release_client::{ReleaseState, read_release_state};
+
+    struct DiscoveryFetcher {
+        responses: std::collections::BTreeMap<String, Vec<u8>>,
+        calls: Vec<String>,
+    }
+
+    impl super::Fetcher for DiscoveryFetcher {
+        fn fetch(&mut self, _: &str) -> Result<Vec<u8>, String> {
+            panic!("unbounded fetch");
+        }
+        fn fetch_with_limit(&mut self, url: &str, _: usize) -> Result<Vec<u8>, String> {
+            self.calls.push(url.into());
+            self.responses.remove(url).ok_or_else(|| "outage".into())
+        }
+        fn fetch_metadata_with_limit(
+            &mut self,
+            url: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, super::ReleaseError> {
+            self.calls.push(url.into());
+            let body = self
+                .responses
+                .remove(url)
+                .ok_or_else(|| super::ReleaseError::Fetch("outage".into()))?;
+            if body.len() > max_bytes {
+                return Err(super::ReleaseError::InvalidManifest(
+                    "response exceeds maximum size".into(),
+                ));
+            }
+            Ok(body)
+        }
+    }
+
+    #[test]
+    fn invalid_signed_discovery_never_uses_checksum_or_cached_recovery() {
+        let root = temp("invalid-discovery");
+        let destination = root.join("tapid");
+        let bytes = b"cached artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let state = ReleaseState::new("0.0.9", 1, digest.clone()).unwrap();
+        persist_activated_release(
+            &destination,
+            &super::release_state_path(&destination),
+            &state,
+            &digest,
+            bytes,
+        )
+        .unwrap();
+        // A working cache must not turn rejection into a successful recovery.
+        assert!(super::recover_last_known_good(&destination, "test-target").is_ok());
+        let now = time::OffsetDateTime::now_utc();
+        let timestamp = |value: time::OffsetDateTime| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let manifest = serde_json::json!({
+            "schema": "tapid-release-manifest-v1", "product": "tapid",
+            "version": "0.0.10", "tag": "v0.0.10", "commit": "a".repeat(40),
+            "created_at": timestamp(now - time::Duration::HOUR),
+            "expires_at": timestamp(now + time::Duration::DAY),
+            "artifacts": [{"name": "tapid-0.0.10-test-target.tar.gz", "target": "test-target",
+                "url": "https://example.test/artifact", "sha256": "a".repeat(64), "size": 5}],
+            "signature": {"algorithm": "ed25519", "key_id": "untrusted",
+                "signed_digest": format!("sha256-{}", "a".repeat(64)),
+                "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}
+        });
+        let mut stale = manifest.clone();
+        stale["expires_at"] = serde_json::json!(timestamp(now - time::Duration::MINUTE));
+        let mut wrong_target = manifest.clone();
+        wrong_target["artifacts"][0]["target"] = serde_json::json!("other-target");
+        for (invalid_index, body, expected) in [
+            (true, vec![], "InvalidManifest"),
+            (
+                false,
+                b"invalid signed manifest".to_vec(),
+                "InvalidManifest",
+            ),
+            (false, serde_json::to_vec(&manifest).unwrap(), "Signature"),
+            (false, serde_json::to_vec(&stale).unwrap(), "StaleMetadata"),
+            (
+                false,
+                serde_json::to_vec(&wrong_target).unwrap(),
+                "TargetNotFound",
+            ),
+        ] {
+            let mut fetcher = DiscoveryFetcher {
+                responses: [
+                    (
+                        "https://example.test/stable.json".into(),
+                        if invalid_index {
+                            b"invalid JSON".to_vec()
+                        } else {
+                            br#"{"channel":"stable","manifests":["https://example.test/manifest"]}"#
+                                .to_vec()
+                        },
+                    ),
+                    ("https://example.test/manifest".into(), body),
+                ]
+                .into_iter()
+                .collect(),
+                calls: vec![],
+            };
+            let result = super::download_release(
+                &mut fetcher,
+                &["https://example.test/stable.json".into()],
+                &super::KeyRing::new(),
+                "test-target",
+                &destination,
+            );
+            let error = result.unwrap_err();
+            assert!(error.starts_with(expected), "{expected}: {error}");
+            assert!(
+                !fetcher
+                    .calls
+                    .iter()
+                    .any(|url| url.contains("api.github.com"))
+            );
+            assert_eq!(
+                read_release_state(&super::release_state_path(&destination)).unwrap(),
+                state
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp(label: &str) -> std::path::PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("tapid-upgrade-{label}-{n}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn activated_release_persistence_writes_cache_and_last_known_good_state() {
+        let root = temp("persist");
+        let destination = root.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        let bytes = b"artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let state = ReleaseState::new("0.0.7", 7, digest.clone()).unwrap();
+
+        persist_activated_release(&destination, &state_path, &state, &digest, bytes).unwrap();
+
+        assert_eq!(
+            fs::read(super::cached_artifact_path(&destination, &digest)).unwrap(),
+            bytes
+        );
+        assert_eq!(read_release_state(&state_path).unwrap(), state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activated_release_persistence_prunes_superseded_cache_files() {
+        let root = temp("prune-cache");
+        let destination = root.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        let old_bytes = b"old artifact";
+        let old_digest = format!("{:x}", sha2::Sha256::digest(old_bytes));
+        let old_state = ReleaseState::new("0.0.6", 6, old_digest.clone()).unwrap();
+        persist_activated_release(
+            &destination,
+            &state_path,
+            &old_state,
+            &old_digest,
+            old_bytes,
+        )
+        .unwrap();
+        let legacy_digest = format!("{:x}", sha2::Sha256::digest(b"legacy artifact"));
+        let legacy_path = super::cached_artifact_path(&destination, &legacy_digest);
+        fs::write(&legacy_path, b"legacy artifact").unwrap();
+        let unrelated_digest = format!("{:x}", sha2::Sha256::digest(b"claimed contents"));
+        let unrelated_path = super::cached_artifact_path(&destination, &unrelated_digest);
+        fs::write(&unrelated_path, b"unrelated user contents").unwrap();
+
+        let new_bytes = b"current artifact";
+        let new_digest = format!("{:x}", sha2::Sha256::digest(new_bytes));
+        let new_state = ReleaseState::new("0.0.7", 7, new_digest.clone()).unwrap();
+        persist_activated_release(
+            &destination,
+            &state_path,
+            &new_state,
+            &new_digest,
+            new_bytes,
+        )
+        .unwrap();
+
+        assert!(!super::cached_artifact_path(&destination, &old_digest).exists());
+        assert!(!legacy_path.exists());
+        assert_eq!(
+            fs::read(unrelated_path).unwrap(),
+            b"unrelated user contents"
+        );
+        assert_eq!(
+            fs::read(super::cached_artifact_path(&destination, &new_digest)).unwrap(),
+            new_bytes
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_failure_does_not_report_activation_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp("cache-cleanup-failure");
+        let cache_directory = root.join("cache");
+        let destination = cache_directory.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        fs::create_dir_all(&cache_directory).unwrap();
+
+        let bytes = b"current artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        fs::write(super::cached_artifact_path(&destination, &digest), bytes).unwrap();
+        let stale_digest = format!("{:x}", sha2::Sha256::digest(b"stale artifact"));
+        let stale_path = super::cached_artifact_path(&destination, &stale_digest);
+        fs::write(&stale_path, b"stale artifact").unwrap();
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let state = ReleaseState::new("0.0.7", 7, digest.clone()).unwrap();
+        let result = persist_activated_release(&destination, &state_path, &state, &digest, bytes);
+
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            read_release_state(&state_path)
+                .unwrap()
+                .last_known_good
+                .artifact_sha256,
+            digest
+        );
+        assert!(stale_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activated_release_persistence_rejects_mismatched_existing_cache() {
+        let root = temp("mismatched-cache");
+        let destination = root.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        let bytes = b"verified artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let state = ReleaseState::new("0.0.7", 7, digest.clone()).unwrap();
+        let cache_path = super::cached_artifact_path(&destination, &digest);
+        fs::write(&cache_path, b"different artifact").unwrap();
+
+        let result = persist_activated_release(&destination, &state_path, &state, &digest, bytes);
+
+        assert_eq!(
+            result.unwrap_err(),
+            "cached artifact digest does not match expected digest"
+        );
+        assert_eq!(fs::read(cache_path).unwrap(), b"different artifact");
+        assert!(!state_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_activation_does_not_persist_pending_release_state() {
+        let root = temp("failed-activation");
+        let destination = root.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        let bytes = b"artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let state = ReleaseState::new("0.0.7", 7, digest.clone()).unwrap();
+
+        let result = super::activate_and_persist(
+            &destination,
+            b"executable",
+            Some((state_path.clone(), state, digest.clone())),
+            bytes,
+            |_destination, _executable| Err("injected activation failure".to_owned()),
+        );
+
+        assert!(result.is_err());
+        assert!(!state_path.exists());
+        assert!(!super::cached_artifact_path(&destination, &digest).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persistence_failure_rolls_back_the_activated_executable() {
+        let root = temp("rollback-persistence");
+        let destination = root.join("tapid");
+        let state_path = root.join(".tapid-release-state.json");
+        fs::write(&destination, b"old executable").unwrap();
+        let bytes = b"artifact";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let cache_path = super::cached_artifact_path(&destination, &digest);
+        fs::write(&cache_path, b"different artifact").unwrap();
+        let state = ReleaseState::new("0.0.7", 7, digest.clone()).unwrap();
+
+        let result = super::activate_and_persist(
+            &destination,
+            b"new executable",
+            Some((state_path.clone(), state, digest)),
+            bytes,
+            |path, executable| fs::write(path, executable).map_err(|e| e.to_string()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"old executable");
+        assert!(!state_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_discovery_is_opt_in() {
+        assert!(stable_discovery_endpoints(&[], None).is_empty());
+    }
+
+    #[test]
+    fn stable_endpoint_overrides_preserve_cli_then_environment_precedence() {
+        let cli = vec!["https://cli.test/stable.json".to_owned()];
+        assert_eq!(
+            stable_discovery_endpoints(&cli, Some("https://env.test/stable.json")),
+            cli
+        );
+        assert_eq!(
+            stable_discovery_endpoints(&[], Some(" https://one.test/a, ,https://two.test/b ")),
+            vec![
+                "https://one.test/a".to_owned(),
+                "https://two.test/b".to_owned()
+            ]
+        );
+        assert_eq!(
+            stable_discovery_endpoints(&[], Some(" , ")),
+            Vec::<String>::new()
+        );
+    }
+
+    fn tar_gz(root: &std::path::Path, entries: &[&str]) -> Vec<u8> {
+        let archive = root.join("artifact.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(root)
+            .args(entries)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::read(archive).unwrap()
+    }
+
+    #[test]
+    fn tar_artifact_rejects_extra_members_before_selecting_tapid() {
+        let root = temp("extra");
+        fs::write(root.join("tapid"), b"new").unwrap();
+        fs::write(root.join("extra"), b"unexpected").unwrap();
+        let bytes = tar_gz(&root, &["tapid", "extra"]);
+        let result = materialize_artifact("tapid.tar.gz", &bytes);
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_artifact_rejects_symlink_members() {
+        let root = temp("symlink");
+        fs::write(root.join("payload"), b"payload").unwrap();
+        std::os::unix::fs::symlink("payload", root.join("tapid")).unwrap();
+        let bytes = tar_gz(&root, &["tapid", "payload"]);
+        assert!(materialize_artifact("tapid.tar.gz", &bytes).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_artifact_rejects_duplicate_members() {
+        let root = temp("duplicate");
+        let plain = root.join("artifact.tar");
+        fs::write(root.join("tapid"), b"new").unwrap();
+        assert!(
+            Command::new("tar")
+                .args(["-cf"])
+                .arg(&plain)
+                .args(["-C"])
+                .arg(&root)
+                .arg("tapid")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("tar")
+                .args(["-rf"])
+                .arg(&plain)
+                .args(["-C"])
+                .arg(&root)
+                .arg("tapid")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let output = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .output()
+            .unwrap();
+        let result = materialize_artifact("tapid.tar.gz", &output.stdout);
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_artifact_rejects_traversal_members() {
+        let fixture = tapid_test_support::TempProject::new("upgrade-traversal").unwrap();
+        // Construct the malicious header directly: archive writers often sanitize
+        // parent components before the reader's traversal check can see them.
+        let mut archive = vec![0_u8; 2048];
+        archive[..8].copy_from_slice(b"../tapid");
+        archive[100..108].copy_from_slice(b"0000755\0");
+        archive[108..116].copy_from_slice(b"0000000\0");
+        archive[116..124].copy_from_slice(b"0000000\0");
+        archive[124..136].copy_from_slice(b"00000000003\0");
+        archive[136..148].copy_from_slice(b"00000000000\0");
+        archive[148..156].fill(b' ');
+        archive[156] = b'0';
+        archive[257..263].copy_from_slice(b"ustar\0");
+        archive[263..265].copy_from_slice(b"00");
+        let checksum: u32 = archive[..512].iter().map(|byte| u32::from(*byte)).sum();
+        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        archive[512..515].copy_from_slice(b"new");
+        let plain = fixture.write("artifact.tar", &archive).unwrap();
+        let output = Command::new("gzip").arg("-c").arg(plain).output().unwrap();
+        assert!(output.status.success());
+        assert!(materialize_artifact("tapid.tar.gz", &output.stdout).is_err());
+    }
+
+    #[test]
+    fn zip_artifact_is_rejected_without_unsafe_extraction() {
+        assert!(materialize_artifact("tapid.zip", b"not a zip").is_err());
+    }
+}

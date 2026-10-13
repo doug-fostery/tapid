@@ -13,7 +13,7 @@ use tapid_publish::{PackageSource, Publisher};
 use tapid_registry_client::{RawRegistrySnapshot, RegistrySnapshot};
 use tapid_resolver::{Dependency, Requirement, ResolutionOptions, resolve};
 use tapid_runner::{Approval, RunnerRequest, ValidationError, plan as runner_plan};
-use tapid_signatures::{TrustEnvelope, VerificationError};
+use tapid_signatures::{KeyRing, SIGNATURE_ALGORITHM, TrustEnvelope, TrustedKey, VerificationError};
 use tapid_store::{IngestResult, Store};
 use tapid_test_support::TempProject;
 
@@ -113,7 +113,7 @@ fn contracts_flow_from_runtime_fixture_to_deterministic_plan() {
         id: PackageInstanceId::new(
             selected.registry.clone(),
             selected.name.clone(),
-            selected.version,
+            selected.version.clone(),
         ),
         peer_context: PeerContext::default(),
         platform_context: PlatformContext::new(Some("linux"), Some("x86_64"), Some("gnu")).unwrap(),
@@ -161,15 +161,15 @@ fn contracts_flow_from_runtime_fixture_to_deterministic_plan() {
         os: "linux".into(),
     };
     let runner = runner_plan(&request, evidence.clone());
-    assert_eq!(runner.policy.evidence(), evidence.as_slice());
-    assert_eq!(runner.policy.decision(), Decision::Warn);
+    assert_eq!(runner.policy().evidence(), evidence.as_slice());
+    assert_eq!(runner.policy().decision(), Decision::Warn);
     assert!(
         runner
-            .policy
+            .policy()
             .reasons()
             .contains(&ReasonCode::DeclaredNetworkCapability)
     );
-    assert!(runner.approval_required);
+    assert!(runner.approval_required());
     assert_eq!(
         runner.validate_approval(&request, None),
         Err(ValidationError::MissingApproval)
@@ -226,5 +226,33 @@ fn unsigned_and_tampered_trust_artifacts_never_become_valid() {
         artifact_digest: "sha256-artifact".into(),
         value: "not-a-signature".into(),
     });
-    assert_eq!(envelope.verify(), Err(VerificationError::SubjectMismatch));
+    assert_eq!(
+        envelope.verify(),
+        Err(VerificationError::UnsupportedAlgorithm("future".into()))
+    );
+}
+
+#[test]
+fn trusted_keyring_verifies_authenticated_envelope_context() {
+    let secret = [11u8; 32];
+    let envelope = TrustEnvelope::unsigned("audit", "sha256-artifact", json!({"ok": true}));
+    let signed = envelope.sign("audit-key-1", &secret).unwrap();
+    let public_key = [
+        0x66, 0xbe, 0x7e, 0x33, 0x2c, 0x7a, 0x45, 0x33, 0x32, 0xbd, 0x9d, 0x0a, 0x7f, 0x7d,
+        0xb0, 0x55, 0xf5, 0xc5, 0xef, 0x1a, 0x06, 0xad, 0xa6, 0x6d, 0x98, 0xb3, 0x9f, 0xb6,
+        0x81, 0x0c, 0x47, 0x3a,
+    ];
+    let mut keyring = KeyRing::new();
+    keyring
+        .insert(TrustedKey {
+            key_id: "audit-key-1".into(),
+            algorithm: SIGNATURE_ALGORITHM.into(),
+            public_key,
+        })
+        .unwrap();
+    assert!(signed.verify_with_keyring(&keyring).is_ok());
+
+    let mut relabeled = signed;
+    relabeled.signature.as_mut().unwrap().key_id = "other-key".into();
+    assert!(relabeled.verify_with_keyring(&keyring).is_err());
 }

@@ -1,0 +1,1120 @@
+use crate::application::outcome::{ErrorKind, OperationalError};
+use fs4::{FileExt, TryLockError};
+use std::{
+    fs,
+    io::{self, Read, Seek, Write},
+    path::{Path, PathBuf},
+};
+const MANAGED_MARKER: &[u8] = b"tapid-managed-v1\n";
+const STAGE_OWNER_MARKER: &str = ".tapid-stage-owner";
+
+pub(crate) fn test_crash_at(point: &str) {
+    if cfg!(debug_assertions) && std::env::var("TAPID_TEST_CRASH_POINT").as_deref() == Ok(point) {
+        std::process::abort();
+    }
+}
+
+#[cfg(all(test, unix))]
+fn activate_node_modules(project: &Path, stage: &Path) -> Result<(), String> {
+    let activation_lock = ActivationLock::acquire(project).map_err(|error| error.to_string())?;
+    activate_node_modules_with_lock(project, stage, &activation_lock, false)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn activate_node_modules_with_lock(
+    project: &Path,
+    stage: &Path,
+    activation_lock: &ActivationLock,
+    preserve_previous: bool,
+) -> Result<(), String> {
+    activate_node_modules_with_preflight(project, stage, activation_lock, preserve_previous, || {
+        Ok(())
+    })
+}
+
+pub(crate) fn activate_node_modules_with_preflight(
+    project: &Path,
+    stage: &Path,
+    activation_lock: &ActivationLock,
+    preserve_previous: bool,
+    preflight: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let staged = stage.join("node_modules");
+    if !staged.is_dir() {
+        return Err("install transaction produced an empty node_modules layout".into());
+    }
+    let destination = project.join("node_modules");
+    let marker = project.join(".tapid-managed");
+    let marker_exists = match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => {
+            return Err("refusing to use a non-regular .tapid-managed marker".to_owned());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot inspect .tapid-managed: {error}")),
+    };
+    if destination.exists() && !marker_exists {
+        return Err(
+            "refusing to replace unmarked node_modules; create .tapid-managed to opt in".into(),
+        );
+    }
+    let owner = activation_lock.owner_name();
+    let marker_backup = project.join(format!(".tapid-managed-old-{owner}"));
+    // Move the existing marker by name before reading it to close the check/read race.
+    if marker_exists {
+        fs::rename(&marker, &marker_backup)
+            .map_err(|e| format!("cannot stage .tapid-managed marker: {e}"))?;
+        sync_directory(project)?;
+        let contents = match read_marker_backup(&marker_backup) {
+            Ok(contents) => contents,
+            Err(error) => {
+                let restore = restore_marker(&marker, &marker_backup, marker_exists);
+                return Err(match restore {
+                    Ok(()) => format!("cannot read .tapid-managed: {error}"),
+                    Err(restore) => format!("cannot read .tapid-managed: {error}; {restore}"),
+                });
+            }
+        };
+        let still_regular = fs::symlink_metadata(&marker_backup)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        if !still_regular || contents != MANAGED_MARKER {
+            let restore = restore_marker(&marker, &marker_backup, marker_exists);
+            let reason = if still_regular {
+                "refusing to replace node_modules with an invalid .tapid-managed marker".into()
+            } else {
+                "refusing to use a non-regular .tapid-managed marker".into()
+            };
+            return Err(match restore {
+                Ok(()) => reason,
+                Err(restore) => format!("{reason}; {restore}"),
+            });
+        }
+    }
+    let backup = project.join(format!(".tapid-node-modules-old-{owner}"));
+    if destination.exists()
+        && let Err(error) = fs::rename(&destination, &backup)
+    {
+        let restore = restore_marker(&marker, &marker_backup, marker_exists);
+        return Err(match restore {
+            Ok(()) => format!("cannot stage existing node_modules for replacement: {error}"),
+            Err(restore) => {
+                format!("cannot stage existing node_modules for replacement: {error}; {restore}")
+            }
+        });
+    }
+    if backup.exists() {
+        sync_directory(project)?;
+        test_crash_at("node_modules_backed_up");
+    }
+    if std::env::var_os("TAPID_TEST_FAIL_ACTIVATION").is_some() {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        let restore = restore_marker(&marker, &marker_backup, marker_exists);
+        return Err(match restore {
+            Ok(()) => "install activation failed (injected)".into(),
+            Err(restore) => format!("install activation failed (injected); {restore}"),
+        });
+    }
+    let staged_is_directory = fs::symlink_metadata(&staged)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !staged_is_directory {
+        let backup_restore = restore_node_modules_backup(&destination, &backup);
+        let marker_restore = restore_marker(&marker, &marker_backup, marker_exists);
+        let mut error = "refusing to activate a non-directory install staging tree".to_owned();
+        if let Err(restore) = backup_restore {
+            error.push_str(&format!("; {restore}"));
+        }
+        if let Err(restore) = marker_restore {
+            error.push_str(&format!("; {restore}"));
+        }
+        return Err(error);
+    }
+    if let Err(error) = preflight() {
+        let backup_restore = restore_node_modules_backup(&destination, &backup);
+        let marker_restore = restore_marker(&marker, &marker_backup, marker_exists);
+        let mut message = error;
+        if let Err(restore) = backup_restore {
+            message.push_str(&format!("; {restore}"));
+        }
+        if let Err(restore) = marker_restore {
+            message.push_str(&format!("; {restore}"));
+        }
+        return Err(message);
+    }
+    if let Err(error) = fs::rename(&staged, &destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        let restore = restore_marker(&marker, &marker_backup, marker_exists);
+        return Err(match restore {
+            Ok(()) => format!("cannot activate node_modules: {error}"),
+            Err(restore) => format!("cannot activate node_modules: {error}; {restore}"),
+        });
+    }
+    sync_directory(project)?;
+    let destination_is_directory = fs::symlink_metadata(&destination)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !destination_is_directory {
+        let _ = fs::remove_file(&destination);
+        let _ = fs::remove_dir_all(&destination);
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        let restore = restore_marker(&marker, &marker_backup, marker_exists);
+        return Err(match restore {
+            Ok(()) => "refusing to activate a symlinked install staging tree".into(),
+            Err(restore) => {
+                format!("refusing to activate a symlinked install staging tree; {restore}")
+            }
+        });
+    }
+    let marker_temp = project.join(format!(
+        ".tapid-managed-{}-{}.tmp",
+        std::process::id(),
+        crate::filesystem::atomic::unique_nonce()
+    ));
+    let marker_result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_temp)
+        .and_then(|mut file| {
+            io::Write::write_all(&mut file, MANAGED_MARKER)?;
+            file.sync_all()?;
+            fs::rename(&marker_temp, &marker)
+        });
+    if let Err(error) = marker_result {
+        let _ = fs::remove_file(&marker_temp);
+        let _ = fs::remove_dir_all(&destination);
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        let restore = restore_marker(&marker, &marker_backup, marker_exists);
+        if !marker_exists {
+            let _ = fs::remove_file(&marker);
+        }
+        return Err(match restore {
+            Ok(()) => format!("cannot write .tapid-managed: {error}"),
+            Err(restore) => format!("cannot write .tapid-managed: {error}; {restore}"),
+        });
+    }
+    sync_directory(project)?;
+    if !preserve_previous {
+        if marker_exists {
+            let _ = fs::remove_file(&marker_backup);
+        }
+        let _ = fs::remove_dir_all(&backup);
+    }
+    let _ = fs::remove_dir_all(stage);
+    Ok(())
+}
+
+fn read_marker_backup(path: &Path) -> Result<Vec<u8>, io::Error> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "marker is not a regular file",
+        ));
+    }
+    read_bounded_owner(&mut file)
+}
+
+fn read_bounded_owner(reader: &mut impl Read) -> Result<Vec<u8>, io::Error> {
+    let mut contents = Vec::with_capacity(129);
+    reader.take(129).read_to_end(&mut contents)?;
+    if contents.len() > 128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "owner value is oversized",
+        ));
+    }
+    Ok(contents)
+}
+
+fn restore_marker(marker: &Path, backup: &Path, marker_exists: bool) -> Result<(), String> {
+    if marker_exists {
+        match fs::symlink_metadata(backup) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                let _ = fs::remove_file(backup);
+                return Err(
+                    "cannot restore .tapid-managed: staged marker is not a regular file".into(),
+                );
+            }
+            Err(error) => return Err(format!("cannot restore .tapid-managed: {error}")),
+        }
+        fs::rename(backup, marker)
+            .map_err(|error| format!("cannot restore .tapid-managed: {error}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_node_modules_backup(destination: &Path, backup: &Path) -> Result<(), String> {
+    if backup.exists() {
+        fs::rename(backup, destination)
+            .map_err(|error| format!("cannot restore existing node_modules: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) struct ActivationLock {
+    file: fs::File,
+    owner: String,
+    pub(crate) recovered: bool,
+}
+
+impl ActivationLock {
+    pub(crate) fn acquire(project: &Path) -> Result<Self, OperationalError> {
+        Self::acquire_mode(project, true)
+    }
+
+    pub(crate) fn acquire_without_recovery(project: &Path) -> Result<Self, OperationalError> {
+        Self::acquire_mode(project, false)
+    }
+
+    fn acquire_mode(project: &Path, recover: bool) -> Result<Self, OperationalError> {
+        let path = project.join(".tapid-activation.lock");
+        let mut file =
+            open_lock_file(&path).map_err(|e| OperationalError::new(ErrorKind::Transaction, e))?;
+        FileExt::try_lock(&file).map_err(|error| match error {
+            TryLockError::WouldBlock => OperationalError::new(
+                ErrorKind::ProjectBusy,
+                format!(
+                    "another node_modules activation is already in progress (lock: {})",
+                    path.display()
+                ),
+            ),
+            TryLockError::Error(error) => {
+                OperationalError::from_source(ErrorKind::Transaction, error)
+                    .context("cannot acquire node_modules activation lock")
+            }
+        })?;
+        let previous_owner = read_bounded_owner(&mut file).map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                OperationalError::new(
+                    ErrorKind::Recovery,
+                    "refusing to recover an oversized node_modules activation lock",
+                )
+            } else {
+                OperationalError::from_source(ErrorKind::Recovery, error)
+                    .context("cannot read node_modules activation lock")
+            }
+        })?;
+        let previous_owner = String::from_utf8(previous_owner).map_err(|_| {
+            OperationalError::new(
+                ErrorKind::Recovery,
+                "refusing to recover a malformed node_modules activation lock",
+            )
+        })?;
+        if !previous_owner.is_empty() && !activation_owner_is_valid(&previous_owner) {
+            return Err(OperationalError::new(
+                ErrorKind::Recovery,
+                "refusing to recover a malformed node_modules activation lock",
+            ));
+        }
+        if !recover {
+            let pending = fs::read_dir(project)
+                .map_err(|e| OperationalError::from_source(ErrorKind::Recovery, e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| OperationalError::from_source(ErrorKind::Recovery, e))?
+                .iter()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(".tapid-lifecycle-journal")
+                        || name.starts_with(".tapid-install-stage-")
+                        || name.starts_with(".tapid-node-modules-old-")
+                        || name.starts_with(".tapid-managed-old-")
+                });
+            if pending {
+                return Err(OperationalError::new(
+                    ErrorKind::Recovery,
+                    "import refuses interrupted install state; finish recovery with tapid install before importing",
+                ));
+            }
+            return Ok(Self {
+                file,
+                owner: previous_owner,
+                recovered: false,
+            });
+        }
+        let decision = crate::filesystem::lifecycle_journal::recover(
+            project,
+            (!previous_owner.is_empty()).then_some(previous_owner.as_str()),
+        )
+        .map_err(|e| OperationalError::new(ErrorKind::Recovery, e))?;
+        let recovery_owner = decision
+            .as_ref()
+            .map(|decision| decision.owner.as_str())
+            .unwrap_or(&previous_owner);
+        if !recovery_owner.is_empty() {
+            recover_owned_activation(project, recovery_owner, decision.clone())
+                .map_err(|e| OperationalError::new(ErrorKind::Recovery, e))?;
+            recover_owned_stages(project, recovery_owner)
+                .map_err(|e| OperationalError::new(ErrorKind::Recovery, e))?;
+        }
+        if decision.is_some() {
+            crate::filesystem::lifecycle_journal::finish_recovery(project)
+                .map_err(|e| OperationalError::new(ErrorKind::Recovery, e))?;
+        }
+        let owner = format!(
+            "{}-{:x}\n",
+            std::process::id(),
+            crate::filesystem::atomic::unique_nonce()
+        );
+        file.set_len(0)
+            .and_then(|()| file.rewind())
+            .and_then(|()| file.write_all(owner.as_bytes()))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                OperationalError::from_source(ErrorKind::Transaction, error)
+                    .context("cannot initialize node_modules activation lock")
+            })?;
+        Ok(Self {
+            file,
+            owner,
+            recovered: decision.is_some(),
+        })
+    }
+
+    pub(crate) fn create_stage(&self, project: &Path) -> Result<PathBuf, String> {
+        let owner = self
+            .owner
+            .strip_suffix('\n')
+            .expect("activation owner is always newline terminated");
+        let stage = project.join(format!(".tapid-install-stage-{owner}"));
+        fs::create_dir(&stage)
+            .map_err(|error| format!("cannot create install staging directory: {error}"))?;
+        if let Err(error) = create_stage_owner_marker(&stage, &self.owner) {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(error);
+        }
+        Ok(stage)
+    }
+
+    pub(crate) fn owner_line(&self) -> &str {
+        &self.owner
+    }
+
+    fn owner_name(&self) -> &str {
+        self.owner
+            .strip_suffix('\n')
+            .expect("activation owner is always newline terminated")
+    }
+}
+
+fn create_stage_owner_marker(stage: &Path, owner: &str) -> Result<(), String> {
+    let marker = stage.join(STAGE_OWNER_MARKER);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(&marker)
+        .map_err(|error| format!("cannot create install staging owner marker: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("cannot inspect install staging owner marker: {error}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("install staging owner marker is not a regular file".into());
+    }
+    file.write_all(owner.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot write install staging owner marker: {error}"))
+}
+
+impl Drop for ActivationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn open_lock_file(path: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        format!(
+            "cannot open node_modules activation lock {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect node_modules activation lock: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("refusing to use a non-regular node_modules activation lock".into());
+    }
+    Ok(file)
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let sync = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x1 | 0x2 | 0x4)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .and_then(|directory| directory.sync_all())
+    };
+    #[cfg(not(windows))]
+    let sync = fs::File::open(path).and_then(|directory| directory.sync_all());
+    sync.map_err(|error| format!("cannot sync activation directory: {error}"))
+}
+
+pub(crate) fn commit_owned_activation(project: &Path, owner: &str) -> Result<(), String> {
+    let owner_name = owner
+        .strip_suffix('\n')
+        .ok_or_else(|| "cannot finalize malformed activation owner".to_owned())?;
+    if !activation_owner_is_valid(owner) {
+        return Err("cannot finalize invalid activation owner".into());
+    }
+    let marker_backup = project.join(format!(".tapid-managed-old-{owner_name}"));
+    match fs::symlink_metadata(&marker_backup) {
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&marker_backup)
+            .map_err(|error| format!("cannot remove committed managed-marker backup: {error}"))?,
+        Ok(_) => return Err("refusing to remove non-regular managed-marker backup".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect managed-marker backup: {error}")),
+    }
+    let node_backup = project.join(format!(".tapid-node-modules-old-{owner_name}"));
+    match fs::symlink_metadata(&node_backup) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(&node_backup)
+                .map_err(|error| format!("cannot remove committed node_modules backup: {error}"))?
+        }
+        Ok(_) => return Err("refusing to remove non-directory node_modules backup".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect node_modules backup: {error}")),
+    }
+    sync_directory(project)?;
+    Ok(())
+}
+
+pub(crate) fn recover_owned_activation(
+    project: &Path,
+    owner: &str,
+    decision: Option<crate::filesystem::lifecycle_journal::RecoveryDecision>,
+) -> Result<(), String> {
+    if let Some(decision) = decision {
+        if decision.committed {
+            return commit_owned_activation(project, owner);
+        }
+        return rollback_coordinated_activation(project, owner, decision);
+    }
+    recover_uncoordinated_activation(project, owner)
+}
+
+fn rollback_coordinated_activation(
+    project: &Path,
+    owner: &str,
+    decision: crate::filesystem::lifecycle_journal::RecoveryDecision,
+) -> Result<(), String> {
+    let owner_name = owner
+        .strip_suffix('\n')
+        .ok_or_else(|| "cannot recover malformed activation owner".to_owned())?;
+    let marker = project.join(".tapid-managed");
+    let marker_backup = project.join(format!(".tapid-managed-old-{owner_name}"));
+    match fs::symlink_metadata(&marker_backup) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if let Ok(current) = fs::symlink_metadata(&marker) {
+                if !current.file_type().is_file() {
+                    return Err(
+                        "refusing to replace non-regular managed marker during recovery".into(),
+                    );
+                }
+                fs::remove_file(&marker).map_err(|error| {
+                    format!("cannot remove uncommitted managed marker: {error}")
+                })?;
+            }
+            fs::rename(&marker_backup, &marker)
+                .map_err(|error| format!("cannot restore managed marker: {error}"))?;
+        }
+        Ok(_) => return Err("refusing to restore non-regular managed marker backup".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !decision.marker_existed {
+                match fs::symlink_metadata(&marker) {
+                    Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&marker)
+                        .map_err(|error| {
+                            format!("cannot remove uncommitted managed marker: {error}")
+                        })?,
+                    Ok(_) => return Err("refusing to remove non-regular managed marker".into()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("cannot inspect managed marker: {error}")),
+                }
+            }
+        }
+        Err(error) => return Err(format!("cannot inspect managed marker backup: {error}")),
+    }
+    let destination = project.join("node_modules");
+    let node_backup = project.join(format!(".tapid-node-modules-old-{owner_name}"));
+    match fs::symlink_metadata(&node_backup) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    fs::remove_dir_all(&destination).map_err(|error| {
+                        format!("cannot remove uncommitted node_modules activation: {error}")
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(
+                        "refusing to replace non-directory node_modules during recovery".into(),
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect node_modules recovery: {error}")),
+            }
+            fs::rename(&node_backup, &destination)
+                .map_err(|error| format!("cannot restore prior node_modules: {error}"))?;
+        }
+        Ok(_) => return Err("refusing to restore a non-directory node_modules backup".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !decision.node_modules_existed {
+                match fs::symlink_metadata(&destination) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                        fs::remove_dir_all(&destination).map_err(|error| {
+                            format!("cannot remove uncommitted node_modules activation: {error}")
+                        })?;
+                    }
+                    Ok(_) => return Err("refusing to remove non-directory node_modules".into()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("cannot inspect node_modules: {error}")),
+                }
+            }
+        }
+        Err(error) => return Err(format!("cannot inspect node_modules backup: {error}")),
+    }
+    Ok(())
+}
+
+fn recover_uncoordinated_activation(project: &Path, owner: &str) -> Result<(), String> {
+    let owner = owner
+        .strip_suffix('\n')
+        .ok_or_else(|| "cannot recover malformed activation owner".to_owned())?;
+    let marker = project.join(".tapid-managed");
+    let marker_backup = project.join(format!(".tapid-managed-old-{owner}"));
+    let destination = project.join("node_modules");
+    let node_backup = project.join(format!(".tapid-node-modules-old-{owner}"));
+
+    let marker_backup_exists = match fs::symlink_metadata(&marker_backup) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if read_marker_backup(&marker_backup)
+                .map_err(|error| format!("cannot read stale managed marker: {error}"))?
+                != MANAGED_MARKER
+            {
+                return Err("refusing to recover an invalid stale managed marker".into());
+            }
+            true
+        }
+        Ok(_) => return Err("refusing to recover a non-regular stale managed marker".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot inspect stale managed marker: {error}")),
+    };
+    let marker_exists = match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => return Err("refusing to recover with a non-regular managed marker".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot inspect managed marker recovery: {error}")),
+    };
+    if marker_backup_exists {
+        if marker_exists {
+            fs::remove_file(&marker_backup)
+                .map_err(|error| format!("cannot remove stale managed marker: {error}"))?;
+        } else {
+            fs::rename(&marker_backup, &marker)
+                .map_err(|error| format!("cannot restore managed marker: {error}"))?;
+        }
+    }
+
+    let node_backup_exists = match fs::symlink_metadata(&node_backup) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => return Err("refusing to recover a non-directory node_modules backup".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot inspect node_modules backup: {error}")),
+    };
+    if node_backup_exists {
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(&node_backup)
+                    .map_err(|error| format!("cannot remove stale node_modules backup: {error}"))?;
+            }
+            Ok(_) => {
+                return Err(
+                    "refusing to recover with a non-directory node_modules destination".into(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&node_backup, &destination).map_err(|error| {
+                    format!("cannot restore stale node_modules backup: {error}")
+                })?;
+            }
+            Err(error) => {
+                return Err(format!("cannot inspect node_modules recovery: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_owned_stages(project: &Path, owner: &str) -> Result<(), String> {
+    let owner_name = owner
+        .strip_suffix('\n')
+        .ok_or_else(|| "cannot recover malformed install stage owner".to_owned())?;
+    let ownerless_stage_name = format!(".tapid-install-stage-{owner_name}");
+    for entry in fs::read_dir(project)
+        .map_err(|error| format!("cannot inspect project for stale install stages: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("cannot inspect stale install stage: {error}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".tapid-install-stage-") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect stale install stage: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let marker = entry.path().join(STAGE_OWNER_MARKER);
+        let marker_metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if name == ownerless_stage_name {
+                    fs::remove_dir_all(entry.path()).map_err(|error| {
+                        format!("cannot remove ownerless stale install stage: {error}")
+                    })?;
+                }
+                continue;
+            }
+            Err(error) => return Err(format!("cannot inspect stale stage ownership: {error}")),
+        };
+        if marker_metadata.len() > 128 {
+            continue;
+        }
+        if read_marker_backup(&marker)
+            .map_err(|error| format!("cannot read stale stage ownership: {error}"))?
+            == owner.as_bytes()
+        {
+            fs::remove_dir_all(entry.path())
+                .map_err(|error| format!("cannot remove stale install stage: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn activation_owner_is_valid(owner: &str) -> bool {
+    let Some(owner) = owner.strip_suffix('\n') else {
+        return false;
+    };
+    let Some((pid, nonce)) = owner.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(all(test, unix))]
+mod activation_tests {
+    use super::{ActivationLock, MANAGED_MARKER, activate_node_modules, recover_owned_activation};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tapid-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn stale_activation_backups_restore_the_previous_layout() {
+        let project = temp_project("activation-backup-rollback");
+        let owner = "123-deadbeef\n";
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(".tapid-managed-old-123-deadbeef"),
+            MANAGED_MARKER,
+        )
+        .unwrap();
+        let backup = project.join(".tapid-node-modules-old-123-deadbeef");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("old"), b"old").unwrap();
+
+        recover_owned_activation(&project, owner, None).unwrap();
+
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            MANAGED_MARKER
+        );
+        assert_eq!(fs::read(project.join("node_modules/old")).unwrap(), b"old");
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn stale_activation_backups_roll_forward_an_activated_layout() {
+        let project = temp_project("activation-backup-roll-forward");
+        let owner = "123-deadbeef\n";
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(".tapid-managed-old-123-deadbeef"),
+            MANAGED_MARKER,
+        )
+        .unwrap();
+        let backup = project.join(".tapid-node-modules-old-123-deadbeef");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("old"), b"old").unwrap();
+        let destination = project.join("node_modules");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("new"), b"new").unwrap();
+
+        recover_owned_activation(&project, owner, None).unwrap();
+
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            MANAGED_MARKER
+        );
+        assert_eq!(fs::read(destination.join("new")).unwrap(), b"new");
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn prepared_coordinator_rolls_back_a_partially_activated_layout() {
+        let project = temp_project("activation-prepared-rollback");
+        let owner = "123-deadbeef\n";
+        fs::create_dir_all(&project).unwrap();
+        let marker_backup = project.join(".tapid-managed-old-123-deadbeef");
+        fs::write(&marker_backup, MANAGED_MARKER).unwrap();
+        fs::write(project.join(".tapid-managed"), b"new marker").unwrap();
+        let backup = project.join(".tapid-node-modules-old-123-deadbeef");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("old"), b"old activation").unwrap();
+        let destination = project.join("node_modules");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("new"), b"uncommitted activation").unwrap();
+
+        let decision = super::super::lifecycle_journal::RecoveryDecision {
+            owner: owner.to_owned(),
+            committed: false,
+            marker_existed: true,
+            node_modules_existed: true,
+        };
+        recover_owned_activation(&project, owner, Some(decision)).unwrap();
+
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            MANAGED_MARKER
+        );
+        assert_eq!(
+            fs::read(destination.join("old")).unwrap(),
+            b"old activation"
+        );
+        assert!(!destination.join("new").exists());
+        assert!(!marker_backup.exists());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn committed_coordinator_keeps_new_activation_and_discards_backups() {
+        let project = temp_project("activation-committed-recovery");
+        let owner = "123-deadbeef\n";
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(".tapid-managed-old-123-deadbeef"),
+            MANAGED_MARKER,
+        )
+        .unwrap();
+        let backup = project.join(".tapid-node-modules-old-123-deadbeef");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("old"), b"old activation").unwrap();
+        let destination = project.join("node_modules");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("new"), b"committed activation").unwrap();
+        fs::write(project.join(".tapid-managed"), MANAGED_MARKER).unwrap();
+
+        let decision = super::super::lifecycle_journal::RecoveryDecision {
+            owner: owner.to_owned(),
+            committed: true,
+            marker_existed: true,
+            node_modules_existed: true,
+        };
+        recover_owned_activation(&project, owner, Some(decision)).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("new")).unwrap(),
+            b"committed activation"
+        );
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            MANAGED_MARKER
+        );
+        assert!(!backup.exists());
+        assert!(!project.join(".tapid-managed-old-123-deadbeef").exists());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn existing_activation_lock_error_includes_the_lock_path() {
+        let project = temp_project("lock-path");
+        let lock_path = project.join(".tapid-activation.lock");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+
+        let error = match ActivationLock::acquire(&project) {
+            Ok(_) => panic!("existing lock must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(&lock_path.display().to_string()));
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn stale_file_lock_reclaims_only_its_owned_stage() {
+        let project = temp_project("stale-lock-recovery");
+        let lock_path = project.join(".tapid-activation.lock");
+        let stale_stage = project.join(".tapid-install-stage-stale");
+        let unrelated_stage = project.join(".tapid-install-stage-unrelated");
+        fs::create_dir_all(&stale_stage).unwrap();
+        fs::create_dir_all(&unrelated_stage).unwrap();
+        fs::write(&lock_path, b"123-deadbeef\n").unwrap();
+        fs::write(stale_stage.join(".tapid-stage-owner"), b"123-deadbeef\n").unwrap();
+        fs::write(
+            unrelated_stage.join(".tapid-stage-owner"),
+            b"different-owner\n",
+        )
+        .unwrap();
+
+        let lock = ActivationLock::acquire(&project).unwrap();
+
+        assert!(!stale_stage.exists());
+        assert!(unrelated_stage.exists());
+        drop(lock);
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn ownerless_pre_marker_stage_is_recovered_from_its_lock_owner_name() {
+        let project = temp_project("ownerless-stage-recovery");
+        let stale = project.join(".tapid-install-stage-123-deadbeef");
+        let unrelated = project.join(".tapid-install-stage-456-cafebabe");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(project.join(".tapid-activation.lock"), b"123-deadbeef\n").unwrap();
+
+        let lock = ActivationLock::acquire(&project).unwrap();
+
+        assert!(!stale.exists());
+        assert!(unrelated.is_dir());
+        drop(lock);
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn live_file_lock_preserves_its_stage_and_rejects_a_second_owner() {
+        let project = temp_project("live-lock-recovery");
+        fs::create_dir_all(&project).unwrap();
+        let first = ActivationLock::acquire(&project).unwrap();
+        let stage = first.create_stage(&project).unwrap();
+
+        let error = match ActivationLock::acquire(&project) {
+            Ok(_) => panic!("live lock must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("already in progress"));
+        assert!(stage.is_dir());
+        drop(first);
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn malformed_stale_lock_cannot_claim_a_stage() {
+        let project = temp_project("malformed-stale-lock");
+        let stage = project.join(".tapid-install-stage-untrusted");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(project.join(".tapid-activation.lock"), b"not-an-owner").unwrap();
+        fs::write(stage.join(".tapid-stage-owner"), b"not-an-owner").unwrap();
+
+        let error = match ActivationLock::acquire(&project) {
+            Ok(_) => panic!("malformed stale lock must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("malformed"));
+        assert!(stage.is_dir());
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn oversized_stale_lock_is_rejected_before_recovery() {
+        let project = temp_project("oversized-stale-lock");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join(".tapid-activation.lock"), vec![b'a'; 129]).unwrap();
+
+        let error = match ActivationLock::acquire(&project) {
+            Ok(_) => panic!("oversized stale lock must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("oversized"));
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn stage_owner_marker_creation_does_not_follow_a_symlink() {
+        use super::create_stage_owner_marker;
+
+        let project = temp_project("stage-owner-symlink");
+        let stage = project.join("stage");
+        let target = project.join("target");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, stage.join(".tapid-stage-owner")).unwrap();
+
+        let error = create_stage_owner_marker(&stage, "123-deadbeef\n").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot create install staging owner marker")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn symlinked_marker_is_rejected_without_touching_target() {
+        let project = temp_project("marker-symlink");
+        let stage = project.join("stage");
+        let target = project.join("attacker-target");
+        fs::create_dir_all(stage.join("node_modules")).unwrap();
+        fs::write(&target, b"must remain unchanged").unwrap();
+        symlink(&target, project.join(".tapid-managed")).unwrap();
+
+        let error = activate_node_modules(&project, &stage).unwrap_err();
+
+        assert!(error.to_string().contains("non-regular"));
+        assert_eq!(fs::read(&target).unwrap(), b"must remain unchanged");
+        assert!(
+            fs::symlink_metadata(project.join(".tapid-managed"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn failed_activation_preflight_restores_previous_layout_and_marker() {
+        use super::activate_node_modules_with_preflight;
+
+        let project = temp_project("activation-preflight-rollback");
+        let stage = project.join("stage");
+        fs::create_dir_all(project.join("node_modules")).unwrap();
+        fs::write(project.join("node_modules/retained"), b"old layout").unwrap();
+        fs::write(project.join(".tapid-managed"), MANAGED_MARKER).unwrap();
+        fs::create_dir_all(stage.join("node_modules")).unwrap();
+        fs::write(stage.join("node_modules/new"), b"new layout").unwrap();
+        let lock = ActivationLock::acquire(&project).unwrap();
+
+        let error = activate_node_modules_with_preflight(&project, &stage, &lock, false, || {
+            Err("workspace validation failed".to_owned())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("workspace validation failed"));
+        assert_eq!(
+            fs::read(project.join("node_modules/retained")).unwrap(),
+            b"old layout"
+        );
+        assert!(!project.join("node_modules/new").exists());
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            MANAGED_MARKER
+        );
+        drop(lock);
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn non_directory_staging_failure_restores_node_modules_and_marker() {
+        let project = temp_project("restore-node-modules");
+        let stage = project.join("stage");
+        let external = project.join("external");
+        fs::create_dir_all(project.join("node_modules")).unwrap();
+        fs::write(project.join("node_modules/retained"), b"old layout").unwrap();
+        fs::write(project.join(".tapid-managed"), b"tapid-managed-v1\n").unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, stage.join("node_modules")).unwrap();
+
+        let error = activate_node_modules(&project, &stage).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-directory install staging tree")
+        );
+        assert_eq!(
+            fs::read(project.join("node_modules/retained")).unwrap(),
+            b"old layout"
+        );
+        assert_eq!(
+            fs::read(project.join(".tapid-managed")).unwrap(),
+            b"tapid-managed-v1\n"
+        );
+        let _ = fs::remove_dir_all(project);
+    }
+}

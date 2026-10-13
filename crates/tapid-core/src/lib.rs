@@ -1,5 +1,10 @@
 use std::{fmt, str::FromStr};
 
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+};
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageName(String);
 
@@ -50,45 +55,57 @@ impl fmt::Display for PackageName {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PackageVersion {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
+/// A canonical SemVer package identity without build metadata.
+///
+/// Prerelease identifiers are preserved because npm packages may depend on an
+/// exact prerelease. Build metadata is rejected because it does not participate
+/// in SemVer precedence and would make registry identities ambiguous.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageVersion(semver::Version);
+
+impl PackageVersion {
+    /// Constructs a stable package version with no prerelease identifier.
+    pub fn stable(major: u64, minor: u64, patch: u64) -> Self {
+        Self(semver::Version::new(major, minor, patch))
+    }
+
+    /// Returns the SemVer major component.
+    pub fn major(&self) -> u64 {
+        self.0.major
+    }
+
+    /// Returns the SemVer minor component.
+    pub fn minor(&self) -> u64 {
+        self.0.minor
+    }
+
+    /// Returns the SemVer patch component.
+    pub fn patch(&self) -> u64 {
+        self.0.patch
+    }
+
+    /// Returns the canonical prerelease identifier sequence when present.
+    pub fn prerelease(&self) -> Option<&str> {
+        (!self.0.pre.is_empty()).then(|| self.0.pre.as_str())
+    }
 }
 
 impl FromStr for PackageVersion {
     type Err = DomainError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut parts = value.split('.');
-        let numbers = [parts.next(), parts.next(), parts.next()];
-        if parts.next().is_some() || numbers.iter().any(Option::is_none) {
+        let version = semver::Version::parse(value)
+            .map_err(|_| DomainError::InvalidPackageVersion(value.to_owned()))?;
+        if !version.build.is_empty() {
             return Err(DomainError::InvalidPackageVersion(value.to_owned()));
         }
-
-        let [Some(major), Some(minor), Some(patch)] = numbers else {
-            unreachable!("checked above");
-        };
-        let parse = |part: &str| {
-            if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
-                return Err(DomainError::InvalidPackageVersion(value.to_owned()));
-            }
-            part.parse::<u64>()
-                .map_err(|_| DomainError::InvalidPackageVersion(value.to_owned()))
-        };
-
-        Ok(Self {
-            major: parse(major)?,
-            minor: parse(minor)?,
-            patch: parse(patch)?,
-        })
+        Ok(Self(version))
     }
 }
 
 impl fmt::Display for PackageVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        self.0.fmt(f)
     }
 }
 
@@ -121,6 +138,10 @@ impl fmt::Display for ArtifactDigest {
     }
 }
 
+/// A canonical, credential-free HTTPS origin for newly resolved identities.
+/// Parsing normalizes host spelling, the default port and slash-only root paths.
+/// Persisted graph readers must reject spelling changes instead of silently
+/// rekeying distinct legacy identities.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RegistryOrigin(String);
 
@@ -134,18 +155,30 @@ impl FromStr for RegistryOrigin {
     type Err = DomainError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let trimmed = value.trim_end_matches('/');
-        let valid = trimmed.starts_with("https://")
-            && trimmed.len() > "https://".len()
-            && !trimmed.contains(['@', '?', '#'])
-            && trimmed[8..]
-                .split('/')
-                .next()
-                .is_some_and(|host| !host.is_empty());
-        if !valid {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| DomainError::InvalidRegistryOrigin(value.to_owned()))?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || value.contains("@")
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.host_str().is_none()
+            || !parsed.path().chars().all(|character| character == '/')
+        {
             return Err(DomainError::InvalidRegistryOrigin(value.to_owned()));
         }
-        Ok(Self(trimmed.to_owned()))
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let host = if host.contains(":") && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        let authority = match parsed.port().filter(|port| *port != 443) {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        Ok(Self(format!("https://{authority}")))
     }
 }
 
@@ -188,15 +221,20 @@ impl FromStr for PackageIntegrity {
         let Some(encoded) = value.strip_prefix("sha512-") else {
             return Err(DomainError::InvalidPackageIntegrity(value.to_owned()));
         };
-        let valid_length = encoded.len() == 86 || encoded.len() == 88;
-        let valid_characters = encoded
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
-        if !valid_length || !valid_characters || (encoded.contains('=') && !encoded.ends_with("=="))
-        {
+        let decoded = if encoded.len() == 86 && !encoded.contains('=') {
+            STANDARD_NO_PAD.decode(encoded)
+        } else if encoded.len() == 88 && encoded.ends_with("==") {
+            STANDARD.decode(encoded)
+        } else {
+            return Err(DomainError::InvalidPackageIntegrity(value.to_owned()));
+        };
+        let Ok(digest) = decoded else {
+            return Err(DomainError::InvalidPackageIntegrity(value.to_owned()));
+        };
+        if digest.len() != 64 {
             return Err(DomainError::InvalidPackageIntegrity(value.to_owned()));
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self(format!("sha512-{}", STANDARD.encode(digest))))
     }
 }
 
@@ -254,7 +292,13 @@ impl PlatformContext {
         if [&context.os, &context.cpu, &context.libc]
             .into_iter()
             .flatten()
-            .any(|v| v.is_empty() || v.chars().any(char::is_whitespace))
+            .any(|v| {
+                v.is_empty()
+                    || v.chars().any(char::is_whitespace)
+                    || v.chars().any(char::is_control)
+                    || v == "-"
+                    || v.contains('|')
+            })
         {
             return Err(DomainError::InvalidPlatformContext);
         }
@@ -264,14 +308,17 @@ impl PlatformContext {
 
 impl fmt::Display for PlatformContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.os.is_none() && self.cpu.is_none() && self.libc.is_none() {
+            return Ok(());
+        }
         let values = [&self.os, &self.cpu, &self.libc];
-        let mut first = true;
-        for value in values.into_iter().flatten() {
-            if !first {
+        for (index, value) in values.into_iter().enumerate() {
+            if index > 0 {
                 f.write_str("-")?;
             }
-            first = false;
-            f.write_str(value)?;
+            if let Some(value) = value {
+                f.write_str(value)?;
+            }
         }
         Ok(())
     }
@@ -338,6 +385,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_canonical_prerelease_versions_without_build_metadata() {
+        let version = "5.20260811.1-alpha".parse::<PackageVersion>().unwrap();
+        assert_eq!(version.to_string(), "5.20260811.1-alpha");
+        assert_eq!(version.prerelease(), Some("alpha"));
+        assert!("1.2.3+build.1".parse::<PackageVersion>().is_err());
+        assert!("1.2.3-01".parse::<PackageVersion>().is_err());
+    }
+
+    #[test]
     fn accepts_only_sha256_digests() {
         let digest = format!("sha256-{}", "A".repeat(64))
             .parse::<ArtifactDigest>()
@@ -348,10 +404,44 @@ mod tests {
 
     #[test]
     fn registry_origin_is_typed_and_canonical_without_secrets() {
-        let origin = "https://REGISTRY.example.test/"
+        let origin = "https://REGISTRY.example.test:443/"
             .parse::<RegistryOrigin>()
             .unwrap();
-        assert_eq!(origin.as_str(), "https://REGISTRY.example.test");
+        assert_eq!(origin.as_str(), "https://registry.example.test");
+        assert_eq!(
+            "https://registry.example.test///"
+                .parse::<RegistryOrigin>()
+                .unwrap()
+                .as_str(),
+            "https://registry.example.test"
+        );
+        assert_eq!(
+            "https://REGISTRY.example.test"
+                .parse::<RegistryOrigin>()
+                .unwrap(),
+            origin
+        );
+        assert_eq!(
+            "https://registry.example.test:8443"
+                .parse::<RegistryOrigin>()
+                .unwrap()
+                .as_str(),
+            "https://registry.example.test:8443"
+        );
+        assert_eq!(
+            "https://[2001:DB8::1]:443/"
+                .parse::<RegistryOrigin>()
+                .unwrap()
+                .as_str(),
+            "https://[2001:db8::1]"
+        );
+        assert_eq!(
+            "https://[2001:db8::1]:8443"
+                .parse::<RegistryOrigin>()
+                .unwrap()
+                .as_str(),
+            "https://[2001:db8::1]:8443"
+        );
         assert!(
             "http://registry.example.test"
                 .parse::<RegistryOrigin>()
@@ -362,13 +452,55 @@ mod tests {
                 .parse::<RegistryOrigin>()
                 .is_err()
         );
+        assert!(
+            "https://@registry.example.test"
+                .parse::<RegistryOrigin>()
+                .is_err()
+        );
+        assert!(
+            "https://registry.example.test?query"
+                .parse::<RegistryOrigin>()
+                .is_err()
+        );
+        assert!(
+            "https://registry.example.test#fragment"
+                .parse::<RegistryOrigin>()
+                .is_err()
+        );
+        assert!(
+            "https://registry.example.test/path|ambiguous"
+                .parse::<RegistryOrigin>()
+                .is_err()
+        );
     }
 
     #[test]
-    fn integrity_preserves_mixed_case_wire_encoding() {
-        let value = format!("sha512-{}", "AbCdEfGh".repeat(11));
+    fn integrity_round_trips_canonical_padded_sha512() {
+        let value = "sha512-vjezHzaHfTgpmqTTye2FWJ751nFdp6l4EtqfRsd2sylZY73USlHKS75q67jhw5cb7uMi0xRAdd1MiTHAfaR9TA==".to_owned();
         let integrity = value.parse::<PackageIntegrity>().unwrap();
         assert_eq!(integrity.to_string(), value);
+    }
+
+    #[test]
+    fn package_integrity_requires_canonical_base64_for_exactly_64_bytes() {
+        let unpadded = format!("sha512-{}", "A".repeat(86));
+        let padded = format!("{unpadded}==");
+        assert_eq!(
+            unpadded.parse::<PackageIntegrity>().unwrap().to_string(),
+            padded
+        );
+        assert!(padded.parse::<PackageIntegrity>().is_ok());
+
+        for invalid in [
+            format!("sha512-{}", "A".repeat(88)),
+            format!("sha512-{}=", "A".repeat(86)),
+            format!("sha512-{}===", "A".repeat(85)),
+        ] {
+            assert!(
+                invalid.parse::<PackageIntegrity>().is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -378,7 +510,7 @@ mod tests {
         let first = PackageInstanceId::new(
             "https://one.example".parse().unwrap(),
             name.clone(),
-            version,
+            version.clone(),
         );
         let second = PackageInstanceId::new("https://two.example".parse().unwrap(), name, version);
         assert_ne!(first, second);
@@ -390,5 +522,22 @@ mod tests {
         assert_eq!(peer.to_string(), "react@18.2.0");
         let platform = PlatformContext::new(Some("linux"), Some("x86_64"), Some("gnu")).unwrap();
         assert_eq!(platform.to_string(), "linux-x86_64-gnu");
+        assert!(PlatformContext::new(Some("linux-x"), None, None).is_ok());
+        assert!(PlatformContext::new(Some("-"), None, None).is_err());
+        assert!(PlatformContext::new(Some("linux|custom"), None, None).is_err());
+        assert!(PlatformContext::new(Some("linux\u{0000}"), None, None).is_err());
+        assert!(PlatformContext::new(Some("linux\u{0007}"), None, None).is_err());
+        assert_eq!(
+            PlatformContext::new(None, Some("x86_64"), None)
+                .unwrap()
+                .to_string(),
+            "-x86_64-"
+        );
+        assert_eq!(
+            PlatformContext::new(Some("linux"), None, Some("gnu"))
+                .unwrap()
+                .to_string(),
+            "linux--gnu"
+        );
     }
 }

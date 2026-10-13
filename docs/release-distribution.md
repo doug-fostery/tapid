@@ -1,0 +1,535 @@
+# Client release distribution
+
+The ordinary release entrypoint and activation checklist are in [Automated releases](release-automation.md). [ADR 0007](adr/0007-one-candidate-one-release-approval.md) supersedes the separate dispatch and promotion approvals described by the historical manual procedure below. This document retains the asset contracts, verification details, and exceptional recovery procedures.
+
+Tapid 0.0.11 completed the first signed-record and generated-installer rollout. Ordinary subsequent releases require no website edit. Repository code alone does not establish that the automatic lane's App and environment configuration has been activated.
+
+## Scope and sources of truth
+
+This document is the operator runbook for releasing the Tapid command-line client. The implementation sources of truth are:
+
+- `.github/workflows/release-publication.yml` for binary builds and draft GitHub releases;
+- `.github/workflows/release-public-smoke.yml` for public installer verification;
+- `.github/workflows/crates-publication.yml` for the automatic release coordinator and crates.io Trusted Publishing;
+- `tools/release/release.ts` for tag validation, checksums, and release-record generation;
+- `tools/release/publish.ts` for the dependency-ordered crates.io plan;
+- `docs/releases/intent.json` for the reviewed automatic release intent;
+- `docs/releases/<version>.md` for reviewed release notes.
+
+ADR 0004 records the GitHub-native foundation; ADR 0006 defines immutable signatures; ADR 0007 defines candidate approval and automatic promotion. This runbook records detailed verification and recovery contracts.
+The [`v0.0.8` operations record](releases/0.0.8-operations.md) preserves the first complete release's concrete evidence and failure lessons.
+
+## Trust model
+
+Tapid relies on the reviewed repository, an annotated version tag, GitHub Actions, the owned domain and its route configuration, the release provider, HTTPS, and repository release immutability. New release archives are accompanied by `SHA256SUMS` and the [release record](release-record-v1.md). GitHub remains the initial provider.
+
+The checksum detects corruption, truncation, and accidental asset substitution. Because the checksum and archive come from the same GitHub release, it is not an independent authenticity proof. The detached Ed25519 sidecar separately authenticates the release record against the embedded production keyring. Immutable record sidecars do not expire; the legacy signed-manifest protocol keeps its expiry checks.
+
+The new installers accept only stable `vX.Y.Z` versions and HTTPS release endpoints. They consume the record through `tapid.dev/releases/v1/latest.tsv`, or the corresponding `vVERSION.tsv` route for an explicit new version. They validate metadata and archive size, verify SHA-256, require exactly one expected regular executable in the archive, extract into a temporary directory, and stage the destination before replacement. The pinned bootstrap enforces its embedded version as a minimum for signed installs. Before replacement, it checks the installed managed executable's version, rejects changed executable bytes at the same version, and applies the durable archive digest and version floor in `.tapid-release-state.json`. It persists the verified archive and new state before replacement, so interruption retains the floor and permits retry or cached recovery of that exact release. An existing destination without a valid ownership marker or readable version fails closed. Explicit versions through 0.0.10 retain the historical GitHub archive and `SHA256SUMS` path unless `TAPID_RELEASE_RECORD_URL` is supplied. That historical path permits fresh installs and byte-identical reinstalls only, and refuses destinations with durable release state. Use `tapid upgrade` for existing managed installations.
+
+Released Tapid 0.0.10 first attempts signed discovery, then uses the canonical GitHub Releases API and `SHA256SUMS` when both default endpoints are unavailable. The next-release default upgrade path reads the same owned-domain release record as the installers, with no GitHub discovery fallback. `--release-url` or `TAPID_RELEASE_RECORD_URL` overrides the record URL; explicit `--endpoint` retains the legacy signed protocol. Invalid received metadata and mismatched downloads fail. Metadata unavailability may use last-known-good recovery but reports that the latest release could not be checked. Identical verified executable bytes leave the installation unchanged. Use `tapid upgrade --dry-run` to inspect the selected release without replacing the binary.
+
+## First release-record rollout
+
+This historical one-time cutover was completed for 0.0.11. Subsequent releases generate the record and installers in the release workflow and need no website edit. The steps below preserve the rollout contract for investigation or a future provider migration.
+
+1. Review the client, installers, publisher, website routes, and tests together. Prepare the website change, but do not deploy the new default installer redirects while the latest public release lacks `tapid-release-v1.tsv`.
+2. Build and review the first eleven-asset draft. Verify the record and signature against all six downloaded archives, including version, immutable URLs, sizes, and hashes. Keep existing public installation working during draft review.
+3. Publish the reviewed draft after approval. Deploy the prepared record/signature routes and generated installer redirects at the controlled cutover, then verify the latest and explicit-version public record routes and public installation. The route returns 404 before a record-bearing release is public, so source tests alone cannot prove this step.
+4. Require the public smoke evidence described below. If the automatic publication run raced the website cutover, rerun the original release-event workflow run after the routes and installer redirects are deployed, and retain both attempts. A new manual dispatch does not satisfy the crates.io gate, which requires a successful `release` event run with the exact release title and tag commit.
+5. Verify an installed 0.0.10 upgrades through its existing GitHub fallback to the new binary, then repeats through the new record path with an already-up-to-date result. Keep historical `/stable.json` behavior unchanged; placing unsigned metadata there breaks released signed-discovery clients.
+
+The website routes are static provider mappings: `latest.tsv` redirects to GitHub's latest release asset, and `vVERSION.tsv` redirects to that version's asset. Matching `.sig` routes select the sidecars. The public installer endpoints redirect to the latest release's generated `install.sh` and `install.ps1` assets. Each installer embeds that release's archive checksums and uses its authenticated native binary to verify the release record. Provider migration changes those mappings and the published artifact URLs. It does not require per-release website deployment or signing-key operations.
+
+## Versioning policy
+
+The Git tag, GitHub release, `tapid` Cargo package, and `tapid --version` output share one product version.
+
+Supporting crates are versioned independently. Publish a supporting crate only when its packaged contents or dependency requirements changed. Do not republish unrelated or unchanged workspace crates merely to align their numbers with the product release.
+
+When an internal `0.0.x` crate changes, update its version and every affected dependent requirement deliberately. Cargo treats `0.0.x` requirements narrowly, so a changed dependency may require a dependent package version bump. The crates.io workflow checks exact-version availability for every workspace package, considers every publishable workspace package, skips exact versions already present on crates.io, and publishes the missing versions in dependency order with `tapid` last. A locally unpublishable path dependency is accepted only when that exact package version is already available from crates.io.
+
+Reconsider a coordinated runtime-crate release group at `0.1.0` only if release evidence shows that nearly every runtime crate changes together. Do not retroactively normalize existing versions.
+
+## Roles and approval boundaries
+
+The automatic lane uses these boundaries:
+
+1. A normal release PR reviews versions, dependency requirements, lockfiles, notes, and release intent.
+2. Merging starts candidate preparation on protected `main`; it does not immediately publish.
+3. The candidate summary binds the selected source commit, archive and installer bytes, notes, and exact crate plan. Required checks and package compatibility run before approval. The required `Release intent freshness` PR status and strict up-to-date protection prevent merging an intent analyzed from stale `main`.
+4. An independent `stable-release` reviewer authorizes the entire candidate, including later GitHub and crates.io publication. Self-review prevention remains enabled.
+5. The workflow signs, creates or safely resumes the draft, and verifies its exact assets before automatic promotion.
+6. Public installer and upgrade smoke must pass before automatic crates.io publication.
+7. The main-only `crates-io-release` environment retains its OIDC identity. Once the reviewed setup is active, it has no second reviewer requirement.
+8. Independent public and registry read-back determine completion.
+
+This deliberately replaces the former separate publication approvals. Do not remove an environment reviewer until the reviewed automatic gate is live and its configuration is verified. See [ADR 0007](adr/0007-one-candidate-one-release-approval.md).
+
+## Historical manual procedure and recovery checks
+
+The numbered procedure below describes the standalone workflows used for 0.0.11. It is a source of detailed verification requirements, not a set of current dispatch commands. Its separate dispatches, final draft publication approval, release-event smoke lookup, and crates.io approval apply to that legacy path, not the ordinary automatic lane. Workflow entrypoints have changed; do not copy the historical dispatch commands against current `main`. Follow [Automated releases](release-automation.md) for routine operation and recovery.
+
+### 1. Prepare a reviewed release pull request
+
+The release pull request must:
+
+- update the `tapid` package to the intended product version;
+- update only changed supporting-crate versions and affected dependency requirements;
+- regenerate `Cargo.lock` through Cargo;
+- add `docs/releases/<version>.md`;
+- review and add the exact intended tag to both upgrade expectations and the self-upgrade expected-release list in `docs/examples/contracts.json`;
+- avoid hardcoding the version in reusable smoke or installer automation;
+- pass the complete required check set and automated review on its final head;
+- have every actionable review conversation answered and resolved.
+
+Run the release contract tests before declaring the pull request ready. The suite
+checks that the release intent has reviewed published documentation expectations.
+Preflight repeats that check on the exact selected source before tag creation or
+release promotion. Unknown versions continue to fail closed.
+
+```sh
+node --experimental-strip-types --test tools/check_architecture_test.ts tools/release/*_test.ts tests/doc_examples_test.ts
+```
+
+Before merge, record the exact pull-request head and base. After merge, read back the concrete merge commit and verify that it is the expected protected `main` tip. Wait for post-merge CI and security checks on that exact commit.
+
+### 2. Create the immutable annotated tag
+
+Before tagging the first release-record release, run `release-signing-check.yml`
+from reviewed `main` and require its protected `stable-release` key check to pass.
+The draft job uses that environment's existing `TAPID_RELEASE_ED25519_PRIVATE_KEY`
+secret and key-ID variable. Verify that the environment permits the intended
+release-tag ref if using automatic tag-triggered signing. A `main`-only policy
+requires dispatching the release workflow from `main` after the tag exists;
+never bypass its independent approval. See
+[release key management](security/release-key-management.md).
+
+Set the intended values explicitly:
+
+```sh
+VERSION=X.Y.Z
+TAG="v$VERSION"
+COMMIT="REPLACE_WITH_VERIFIED_RELEASE_MERGE_COMMIT"
+```
+
+Verify the source before creating the tag:
+
+```sh
+set -euo pipefail
+git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+test "$(git rev-parse "origin/main^{commit}")" = "$COMMIT"
+test "$(git show "$COMMIT:crates/tapid-cli/Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)" = "$VERSION"
+
+test -z "$(git tag --list "$TAG")" || {
+  echo "local tag already exists; use the failed tag-push recovery procedure: $TAG" >&2
+  exit 1
+}
+remote_tag_refs="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+test -z "$remote_tag_refs" || {
+  echo "remote tag already exists: $TAG" >&2
+  exit 1
+}
+```
+
+Create and push the annotated tag exactly once:
+
+```sh
+git tag -a "$TAG" "$COMMIT" -m "Tapid $TAG"
+git push origin "refs/tags/$TAG"
+```
+
+Immediately read back both the tag object and peeled commit:
+
+```sh
+git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
+```
+
+Record both object identifiers. Never move, recreate, delete and recreate, or force-push a release tag.
+
+### 3. Verify the binary workflow
+
+The tag-triggered workflow must:
+
+- refetch and validate the remote annotated tag object;
+- require the peeled commit to belong to `main`;
+- check out the exact peeled commit for metadata validation and every build;
+- build the six native targets on Linux, macOS, and Windows runners;
+- execute each native binary and require `tapid <version>`;
+- produce six platform archives;
+- aggregate artifacts by explicit name pattern;
+- create one new draft release only when no release already matches the tag;
+- retain the numeric release ID returned by creation;
+- tolerate brief collection read-after-write delay with bounded retries;
+- require exactly one matching release whose ID equals the create response;
+- generate `tapid-release-v1.tsv` from the immutable archive bytes;
+- generate its `tapid-release-v1.tsv.sig` sidecar with the protected release key;
+- upload and read back the exact eleven-asset set.
+
+Warnings and notices are evidence, not harmless decoration. Inspect the workflow annotations even when every job is green. Upgrade deprecated action runtimes and validate announced runner-image migrations in an ordinary pull request before their deadlines.
+
+### 4. Review the draft by numeric release ID
+
+A draft is not public and some tag-based REST endpoints return 404 for drafts. List releases, including drafts, identify exactly one matching tag, and retain its numeric ID. Use that ID for subsequent API reads and asset downloads.
+
+The expected asset set is exactly:
+
+- `tapid-<version>-aarch64-apple-darwin.tar.gz`
+- `tapid-<version>-x86_64-apple-darwin.tar.gz`
+- `tapid-<version>-aarch64-unknown-linux-gnu.tar.gz`
+- `tapid-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `tapid-<version>-aarch64-pc-windows-msvc.tar.gz`
+- `tapid-<version>-x86_64-pc-windows-msvc.tar.gz`
+- `SHA256SUMS`
+- `tapid-release-v1.tsv`
+- `tapid-release-v1.tsv.sig`
+- `install.sh`
+- `install.ps1`
+
+This is eleven assets for the new release flow. Historical releases through 0.0.10 have seven assets and no release record. Public smoke uses those releases' original installer scripts pinned to their resolved commit SHA. New releases use the generated installer assets; the same distinction applies when comparing the public website installer with latest. Recovery must use the asset contract of the original tagged workflow; never add metadata to a published historical release.
+
+Before publication:
+
+1. Require `draft=true`, `prerelease=false`, the exact tag, and the expected release ID.
+2. Require exactly eleven assets and no unexpected names for a new release.
+3. Record every asset ID, name, and provider-reported size.
+4. Download every asset from GitHub by numeric asset ID into a fresh directory.
+5. Compare each downloaded size with the provider-reported size.
+6. Verify all six archives against the downloaded `SHA256SUMS`. Regenerate both installers with `tools/release/bootstrap.ts` from these downloaded archives and the exact release download base URL, then compare their bytes with the draft's installer assets.
+7. Require each archive to contain exactly one regular file named `tapid` or `tapid.exe`, as appropriate.
+8. Execute the locally compatible downloaded binary and require `tapid <version>`.
+9. Correlate the other binaries with successful native build jobs that executed the version check.
+10. Review `docs/releases/<version>.md` and require the draft body to match it exactly.
+11. Parse the release record and compare all six rows with the downloaded archive names, byte counts, SHA-256 values, and immutable public download URLs. Require its version to match the tag.
+
+On macOS, checksum verification can use:
+
+```sh
+(cd <download-directory> && shasum -a 256 -c SHA256SUMS)
+```
+
+On Linux, use `sha256sum -c SHA256SUMS`.
+
+An HTTP 200 response does not prove installation or asset correctness.
+
+### 5. Edit draft metadata safely
+
+The create-release API requires `tag_name`; the update-release API does not. During `v0.0.8`, however, an incomplete metadata update through the client and payload shape used at the time exposed the draft under an internal `untagged-*` slug. Treat that observed failure as a reason to make draft edits explicit and immediately verifiable, not as a claim that every PATCH requires a complete record.
+
+Avoid editing metadata after final draft approval. If notes or other metadata must change before approval, identify the release by numeric ID, snapshot its current state, and send a minimal update containing only the fields that are intentionally changing. Avoid a client or payload shape that injects defaults for omitted fields.
+
+Before and after the update, compare:
+
+- `tag_name`;
+- `target_commitish`;
+- `name`;
+- `body`;
+- `draft=true`;
+- `prerelease=false`;
+- `make_latest=false`.
+
+For an existing annotated tag, `target_commitish` does not determine source identity. Keep the draft's normal `main` value. The existing annotated tag and its peeled commit are the immutable source binding.
+
+Changing `target_commitish` to an older commit that modifies `.github/workflows` relative to the default branch can require additional OAuth `workflow` scope. GitHub may deliberately return 404 when that scope is absent. Do not broaden token scope merely to make an unnecessary metadata edit work.
+
+After every draft edit, read back the release by numeric ID and through the draft-aware `gh release view` surface. Require the original release ID, exact tag, expected asset set, reviewed body, `draft=true`, and unchanged remote tag object and peeled commit. Require every field outside the intended change set to remain byte-for-byte or value-for-value unchanged. The edit invalidates any prior approval; repeat the final draft review before publication.
+
+### 6. Publish the reviewed draft
+
+Publication requires explicit human approval after the final draft read-back. Promote the already-reviewed numeric release record without resupplying its notes, title, tag, target, or prerelease state:
+
+```sh
+RELEASE_ID="REPLACE_WITH_VERIFIED_NUMERIC_RELEASE_ID"
+case "$RELEASE_ID" in
+  ''|*[!0-9]*) echo "invalid numeric release ID" >&2; exit 1 ;;
+esac
+gh api --method PATCH \
+  "repos/LimeTip/tapid/releases/$RELEASE_ID" \
+  -F draft=false \
+  -f make_latest=true
+```
+
+This minimizes the irreversible promotion mutation and prevents a dirty, stale, or later-modified local notes file from replacing the approved body at publication time.
+
+Immediately verify through an unauthenticated API request that:
+
+- the public release ID is the reviewed draft ID;
+- `tag_name` equals the intended tag;
+- `draft=false` and `prerelease=false`;
+- the exact eleven assets remain present for the new release;
+- the release is immutable when repository release immutability is enabled;
+- the remote annotated tag object and peeled commit are unchanged.
+
+### 7. Verify public installation
+
+For a manually published legacy release, publication triggers `.github/workflows/release-public-smoke.yml` at the tagged commit. The automatic coordinator calls public smoke explicitly after promotion and uses its exact-candidate result; it does not depend on a token-generated release event. Require the resolver to succeed and all three platform jobs:
+
+- `Unix installer (ubuntu-latest)`;
+- `Unix installer (macos-latest)`;
+- `Windows installer`.
+
+Each platform must:
+
+1. Download the tagged installer from the source provider and retain its URL, release source revision, script digest, and installation evidence.
+2. Install the explicit published version, execute it, and require `tapid <version>`.
+3. Independently download the public `tapid.dev` installer, install the explicit version, and require the same binary bytes as the tagged installer produced.
+4. Install latest through the public website installer without an explicit version and verify its expected version.
+5. For a latest release newer than 0.0.10, install the highest supported earlier stable version found among the latest 100 releases, upgrade it, and compare its resulting version and executable digest with the independent latest installation.
+6. Repeat the upgrade and require the exact already-up-to-date output and unchanged executable bytes. Retain evidence even on failure.
+
+The scheduled daily run covers Linux; release and manual runs cover Linux, macOS, and Windows. Historical latest versions through 0.0.10 explicitly skip the new truthful-repeat assertion. The canonical documentation upgrade check remains separate. Matching source and destination releases demonstrate repeated installation, not a previous-version upgrade.
+
+Read the job steps and logs. Do not infer real installation from workflow success alone.
+
+The supplemental root-script fixture uses `tests/fixtures/validate_consumer_project.js`
+against the installed binary, not a source build. Before tagging, review its
+`tests/fixtures/consumer_contracts.json` capability data alongside
+`docs/examples/contracts.json`. The current contract uses the product version
+from `crates/tapid-cli/Cargo.toml`; historical contracts list exact reviewed tags.
+Unknown published tags fail until reviewed; never infer support from an arbitrary
+command failure. The v0.0.11 native Restricted contract requires macOS and Linux child execution,
+exact arguments, environment/exit-code checks and receipts. Windows must return
+the specific unsupported-containment rejection with no child marker or receipt.
+The historical v0.0.10 contract requires that rejection on Linux as well. The historical uncontained contract retains forwarding checks
+without claiming containment. These expected contracts are not public execution
+evidence.
+
+Pull-request CI also runs `PR published-binary regression` on Linux, macOS and
+Windows. This unprivileged test checks out the exact PR head, downloads the
+installer from the pinned v0.0.10 source commit, and installs that immutable
+published version with the installer's existing checksum and archive checks.
+It uses isolated home, cache/store, binary and temporary directories. The existing
+consumer validator checks install/lifecycle suppression and the platform-specific
+root-script contract.
+The job has read-only repository permissions, no secrets, no release environment
+and no artifact uploads. Its logs identify the PR source, release source, binary
+version and binary digest. These are **pre-merge regression results**, not public
+release readiness, package compatibility, upgrade or website promotion evidence.
+The trusted-main runner and approval gates in public installer smoke remain
+unchanged; this PR lane does not satisfy those release gates.
+
+Latest discovery and the configured Unix upgrade checks depend on their explicit
+installation prerequisites, not on successful supplemental script checks. An
+earlier failure still fails the job. Upgrade reports remain required for attempted
+upgrades; a skipped upgrade does not trigger a misleading missing-artifact failure.
+Inspect skipped prerequisites separately and do not count them as verified.
+
+Do not start crates.io publication until the public release and all three installer jobs are verified against the exact tag commit.
+
+### 8. Verify and dispatch crates.io publication separately
+
+Run the publication planner from the tagged source tree (or pass that tree with `--workspace`):
+
+```sh
+node --experimental-strip-types tools/release/publish.ts --json
+```
+
+Planning is read-only by default and does not require crates.io credentials. It performs exact-version registry checks, excludes already-published versions, reports transient/429 lookups and unsafe version drift as blockers, and emits dependency-first order. The JSON plan lists the discovered root and nested `Cargo.lock` files, locked metadata checks for nested workspaces, workspace package verification, and the clean `tapid` install/version commands. `--publish` is the only mode that can mutate crates.io; do not use it outside the protected workflow. After a partial publication, rerun the planner and review the remaining dependency-ordered suffix.
+
+The workflow first displays the machine-readable plan in an unprivileged preflight job. Before the protected job can start, preflight must also pass `cargo package --workspace --locked` and the nested integration-workspace metadata check from the exact tagged source tree, using an isolated Cargo home and no publication credentials. This full workspace package verification runs before any OIDC token exists and blocks on package or API/version incompatibilities (including the class tracked by #28). After authentication, the protected job recomputes the plan using read-only Cargo metadata and registry checks, then runs only `cargo publish --no-verify --locked`; it performs no package/build/test verification with the token present. Publication uses the pre-verified immutable tag source, the publish subprocess receives a restricted environment containing the short-lived token and necessary system settings only, and the job waits for exact crates.io read-back before advancing.
+
+Review the exact missing package/version sequence. Every package in that plan must have exactly one crates.io Trusted Publisher configuration with:
+
+- repository owner `LimeTip`;
+- repository name `tapid`;
+- workflow `crates-publication.yml`;
+- environment `crates-io-release`;
+- trusted-publishing-only enabled.
+
+The GitHub environment must:
+
+- allow the workflow run from `main`;
+- require independent approval;
+- prevent the dispatching actor from approving the same deployment.
+
+Dispatch the trusted workflow from `main` only after separate explicit approval:
+
+```sh
+gh workflow run crates-publication.yml \
+  --repo LimeTip/tapid \
+  --ref main \
+  -f tag="$TAG"
+```
+
+The workflow code is checked out from the trusted workflow commit on `main`; it fetches and validates the annotated release tag as a separate immutable source tree. It verifies the matching public GitHub release and exact-tag public smoke run, and refuses to continue if the publication plan changes between preflight and the protected job.
+
+No long-lived crates.io token is stored in GitHub. Do not add one as a fallback.
+
+After environment approval, the workflow publishes one crate at a time, reads back each exact version before advancing, then installs the exact `tapid` version from a clean Cargo home and executes the installed binary. If publication partially succeeds or registry propagation is delayed, query crates.io independently and rerun the plan; never blindly repeat `cargo publish` for a version that may already exist.
+
+### 9. Complete final public read-back
+
+A release is complete only after verifying:
+
+- protected `main` and its post-merge checks;
+- annotated tag object and peeled commit;
+- public immutable GitHub release and reviewed release ID;
+- exact asset names, sizes, and SHA-256 values from public downloads;
+- archive structure and locally compatible binary version;
+- public `tapid.dev/install.sh` and `tapid.dev/install.ps1` endpoints;
+- latest and explicit-version `tapid.dev/releases/v1/*.tsv` records matching the published archive metadata;
+- explicit-version installation on Ubuntu, macOS, and Windows;
+- latest-release discovery installation on Ubuntu, macOS, and Windows;
+- previous-version upgrade and unchanged repeat upgrade on those platforms;
+- every planned crates.io version;
+- clean `cargo install tapid --version <version> --locked` behavior;
+- final repository, release, tag, workflow, and registry state.
+
+## Recovery procedures
+
+Recovery must preserve the original annotated tag and exact tagged commit. The procedures below describe evidence checks and the historical standalone workflow recovery. Use the coordinator recovery entrypoint in [Automated releases](release-automation.md#recover-a-failed-run) for new releases; input-free build and separate crates dispatch commands below belong to the former workflow revisions.
+
+### Local annotated tag exists after a failed push
+
+If local tag creation succeeded but `git push` failed or returned an uncertain result, do not delete or recreate the local tag and do not rerun the tag-creation block.
+
+Set `TAG` and `COMMIT` to the intended release values, then validate and safely resume:
+
+```sh
+set -euo pipefail
+tag_ref="refs/tags/$TAG"
+
+test "$(git cat-file -t "$tag_ref")" = tag
+local_tag_object="$(git rev-parse "$tag_ref")"
+local_tag_commit="$(git rev-parse "$tag_ref^{commit}")"
+test "$local_tag_commit" = "$COMMIT"
+
+git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+git merge-base --is-ancestor "$COMMIT" origin/main
+
+remote_refs="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"
+if test -z "$remote_refs"; then
+  git push origin "$tag_ref:$tag_ref"
+else
+  remote_tag_object=
+  remote_tag_commit=
+  while IFS=$'\t' read -r object_id ref_name; do
+    case "$ref_name" in
+      "$tag_ref") remote_tag_object="$object_id" ;;
+      "$tag_ref^{}") remote_tag_commit="$object_id" ;;
+    esac
+  done <<< "$remote_refs"
+
+  test "$remote_tag_object" = "$local_tag_object"
+  test "$remote_tag_commit" = "$local_tag_commit"
+fi
+
+verified_refs="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"
+verified_tag_object=
+verified_tag_commit=
+while IFS=$'\t' read -r object_id ref_name; do
+  case "$ref_name" in
+    "$tag_ref") verified_tag_object="$object_id" ;;
+    "$tag_ref^{}") verified_tag_commit="$object_id" ;;
+  esac
+done <<< "$verified_refs"
+test "$verified_tag_object" = "$local_tag_object"
+test "$verified_tag_commit" = "$local_tag_commit"
+```
+
+An exact remote match means the original push succeeded despite the uncertain local result. An absent remote ref permits retrying the same local tag push. A lightweight remote tag, different tag object, or different peeled commit is a hard stop requiring investigation; never replace it.
+
+### Tag-triggered workflow fails before draft creation
+
+1. Diagnose the failed run and preserve its logs.
+2. Fix the workflow through a normal reviewed pull request.
+3. Merge and verify post-merge checks.
+4. Manually dispatch the current input-free release workflow from `main`.
+5. The workflow derives the expected tag from reviewed Cargo metadata, refetches the remote annotated tag, and builds the exact peeled commit.
+
+Never recreate or push the tag again merely to retrigger the workflow. Do not rerun a historical workflow revision if it would build mutable `main` instead of the exact tag commit.
+
+### Draft exists but workflow failed before or during asset upload
+
+Do not dispatch the create-only workflow again and do not create a duplicate release.
+
+1. Identify the existing draft by listing all releases and recording its numeric ID.
+2. Confirm the draft tag and ID correspond to the failed create response.
+3. Download only successful build artifacts from the exact failed run.
+4. Require all six expected archives and reject extra files.
+5. Generate and verify `SHA256SUMS` from those exact bytes. For the new release flow, also generate the release record using that version's immutable public download directory.
+6. Inspect archive layout and correlate native version checks with the build logs.
+7. List assets already attached to the draft by numeric release ID. Require their names to be a unique subset of the expected asset set and reject unexpected or duplicate names. Use eleven assets for the new flow or seven for a historical tagged workflow.
+8. Download every existing asset by numeric asset ID. Require its size and SHA-256 to match the corresponding locally recovered file exactly. Stop on any mismatch; never overwrite or delete an ambiguous asset.
+9. Upload only expected names that are not already present, using the existing numeric release ID.
+10. Download every resulting asset back by numeric asset ID.
+11. Recheck names, sizes, checksums, archive layout, draft state, tag object, and peeled commit.
+
+Manual recovery is an evidence-preserving exception, not the normal release path.
+
+### Draft tag becomes `untagged-*`
+
+Stop before publication. Do not delete the release or tag.
+
+1. Locate the draft through the release collection and confirm its original numeric ID and expected asset set.
+2. Confirm the real annotated version tag still exists and peels to the original commit.
+3. Restore the draft with a complete metadata update containing the intended `tag_name`, `target_commitish: main`, title, reviewed body, `draft=true`, `prerelease=false`, and `make_latest=false`.
+4. Read back by numeric ID and with `gh release view <tag>`.
+5. Require the same ID, exact tag, expected asset set, reviewed notes, draft state, and unchanged tag object before continuing.
+
+A 404 while changing the target to an older workflow-bearing commit can mean the token lacks OAuth `workflow` scope. Keep `target_commitish: main` for an existing tag instead of expanding credentials. The annotated tag remains the source binding.
+
+### Public smoke fails after publication
+
+A published immutable release cannot be repaired in place.
+
+1. Stop crates.io publication.
+2. Preserve logs and determine affected platforms.
+3. Communicate the limitation if users can encounter it.
+4. Fix through a new reviewed patch release with a new annotated tag.
+5. Do not move the existing tag, replace assets, or pretend a rerun changed published bytes.
+
+### crates.io publication partially succeeds
+
+Published crate versions are immutable.
+
+1. Record every confirmed package/version and the failing package.
+2. Query crates.io independently rather than trusting only the failed workflow log.
+3. Run `node --experimental-strip-types tools/release/publish.ts --json` again against the registry.
+4. Require the new plan to contain only the still-missing suffix of the dependency order.
+5. Respect crates.io rate-limit instructions and avoid rapid blind retries.
+6. Resume only after confirming the failure is safely resumable. The automatic lane must retain the approved candidate and restrict publication to its independently confirmed remaining package versions; the standalone fallback retains any approval gates required by its active configuration.
+
+## Evidence ledger
+
+Record the following for every release in the release issue, pull request, or operator record:
+
+- release-preparation PR URL, final head, and merge commit;
+- post-merge check-run IDs and conclusions;
+- annotated tag object ID and peeled commit;
+- binary workflow run ID and any recovery run ID;
+- draft/public release ID;
+- asset IDs, names, sizes, and SHA-256 values;
+- release-notes source and exact read-back result;
+- publication time and immutable state;
+- public smoke run ID, tagged commit, three job names, and conclusions;
+- crates.io dry-run plan;
+- Trusted Publisher verification result;
+- release coordinator run ID and independent candidate approval state;
+- published package/version set;
+- clean registry installation command and binary output;
+- final public endpoint and repository-state verification.
+
+Replace credentials, tokens, cookies, signing material, and secret values with `[REDACTED]`. Do not store them in the evidence ledger.
+
+## Prohibited actions
+
+Never:
+
+- move, recreate, delete and recreate, or force-push a release tag;
+- publish a draft before exact asset and note verification;
+- use an HTTP 200 response as installation evidence;
+- select a draft upload target only by tag when a numeric release ID is available;
+- overwrite release assets or create a duplicate release during recovery;
+- rebuild mutable `main` and label it as an existing tagged release;
+- publish crates.io packages before public installer smoke succeeds;
+- fall back to a long-lived crates.io token when Trusted Publishing fails;
+- align unchanged crate versions merely for cosmetic consistency;
+- call a release complete before independent public and registry read-back.
+
+## Residual risks
+
+- A compromised discovery route or release provider can replay a previously signed record but cannot change its bytes without the release key. A non-expiring signature does not prove latest-release freshness. Signed installers enforce the bootstrap-pinned minimum version even for fresh installs, and existing installations additionally enforce installed-version and durable digest/version floors. Replaying an older HTTPS-delivered installer can also replay its older bootstrap floor; these local floors do not prove latest-release freshness. Repository, workflow, or signing-key compromise can still authorize malicious releases.
+- Historical checksum-only installers permit fresh installs or identical-byte reinstalls and cannot replace destinations with durable release state. Explicit development source installs remain separately selected operations.
+- Public smoke tests run after publication and can detect but cannot prevent a broken release from briefly being available.
+- macOS and Windows platform code signing are not part of this flow.

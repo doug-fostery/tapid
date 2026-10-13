@@ -1,8 +1,14 @@
 # tapid-archive
 
+[![CI](https://github.com/LimeTip/tapid/actions/workflows/ci.yml/badge.svg)](https://github.com/LimeTip/tapid/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/tapid-archive)](https://crates.io/crates/tapid-archive)
+[![Crates.io downloads](https://img.shields.io/crates/d/tapid-archive)](https://crates.io/crates/tapid-archive)
+[![Docs.rs](https://docs.rs/tapid-archive/badge.svg)](https://docs.rs/tapid-archive)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/LimeTip/tapid/blob/main/LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
-[Crates.io](https://crates.io/crates/tapid-archive) | [GitHub](https://github.com/LimeTip/tapid/tree/main/crates/tapid-archive)
+`tapid-archive` validates archive entry metadata before extraction. Names using either slash style are checked. Traversal, absolute, drive, and UNC paths are rejected. Entry count, path length, compressed size, extracted size, and path limits are explicit. Duplicate and case-colliding names, links, device nodes, and other special files are rejected. Tar and tar.gz archives are extracted into a fresh staging directory.
 
-`tapid-archive` validates archive entry metadata before extraction. Names using either slash style are checked. Traversal, absolute, drive, and UNC paths are rejected. Entry count, path length, and byte limits are explicit. Duplicate and case-colliding names, hardlinks, device nodes, and other special files are rejected. Relative symlinks are allowed only when their lexical target remains inside the archive root.
+Unix extraction normalizes regular files to `0644` or `0755`, preserves only the executable distinction, and strips ownership and privilege bits. A canonical internal mode manifest makes executable-aware tree digests identical across Unix and Windows while Unix verification also checks the actual mode. The crate does not scan executable content or provide malware detection; store activation remains a separate layer.
 
-The crate does not decompress archives, access the filesystem, scan executable content, or provide malware detection. Callers provide typed entry metadata and choose limits explicitly. Extraction and store activation belong to other layers.
+`validate_tree` applies portable archive bounds to generated filesystem outputs and rejects symlinks, special files, noncanonical paths, and reserved store metadata. Canonical tree hashing streams regular-file contents while preserving the established digest framing.

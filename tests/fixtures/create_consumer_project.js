@@ -6,10 +6,8 @@ const path = require('path');
 const projectDirectory = fs.mkdtempSync(
   path.join(os.tmpdir(), 'tapid-consumer-'),
 );
-const positional = String.fromCharCode(36);
-const testScript = process.platform === 'win32'
-  ? 'node fixture.js'
-  : `node fixture.js ${positional}1 ${positional}2`;
+// Tapid appends shell-quoted positional arguments itself; do not also add $1/$2.
+const testScript = 'node fixture.js';
 
 const packageJson = JSON.stringify(
   {
@@ -19,9 +17,6 @@ const packageJson = JSON.stringify(
     scripts: {
       preinstall: "node -e \"require('fs').writeFileSync('LIFECYCLE_SHOULD_NOT_RUN', 'x')\"",
       test: testScript,
-    },
-    bin: {
-      fixture: 'fixture.js',
     },
   },
   null,
@@ -34,7 +29,7 @@ const manifestDigest = crypto
   .digest('hex');
 const lockfile = JSON.stringify(
   {
-    lockfileVersion: 3,
+    lockfileVersion: 4,
     rootManifestDigest: `sha256-${manifestDigest}`,
     resolverVersion: '0',
     linkerVersion: '0',
@@ -45,15 +40,34 @@ const lockfile = JSON.stringify(
 ) + '\n';
 
 const fixtureScript = [
-  "if (process.argv[2] !== 'forwarded') process.exit(41);",
-  "if (process.env.TAPID_FIXTURE !== '1') process.exit(42);",
-  "if (require('fs').existsSync('LIFECYCLE_SHOULD_NOT_RUN')) process.exit(43);",
-  'process.exit(Number(process.argv[3] || 0));',
+  // A stdout marker proves Node ran without granting any filesystem writes.
+  "console.log('TAPID_FIXTURE_STARTED=' + JSON.stringify(process.argv.slice(2)));",
+  "if (process.argv.length !== 4) process.exitCode = 44;",
+  "else if (process.argv[2] !== 'forwarded') process.exitCode = 41;",
+  "else if (process.env.TAPID_FIXTURE !== '1') process.exitCode = 42;",
+  "else if (require('fs').existsSync('LIFECYCLE_SHOULD_NOT_RUN')) process.exitCode = 43;",
+  'else process.exitCode = Number(process.argv[3] || 0);',
+  '',
+].join('\n');
+
+const runPolicy = [
+  '[run.defaults]',
+  'read = ["."]',
+  'write = []',
+  'network = false',
+  'environment = []',
+  'subprocess = true',
+  // AssuranceLevel uses serde kebab-case, not the Rust enum spelling.
+  'assurance = "restricted"',
+  '',
+  '[run.scripts.test]',
+  'environment = ["TAPID_FIXTURE"]',
   '',
 ].join('\n');
 
 fs.writeFileSync(path.join(projectDirectory, 'package.json'), packageJson);
 fs.writeFileSync(path.join(projectDirectory, 'tapid.lock'), lockfile);
+fs.writeFileSync(path.join(projectDirectory, 'tapid.toml'), runPolicy);
 fs.writeFileSync(path.join(projectDirectory, 'fixture.js'), fixtureScript);
 fs.writeFileSync(
   path.join(projectDirectory, 'fixture-contract.json'),
@@ -62,7 +76,7 @@ fs.writeFileSync(
     checks: [
       'install',
       'root-script',
-      'bin-shim',
+      'checked-in-run-policy',
       'argument-forwarding',
       'exit-code',
       'lifecycle-suppression',
