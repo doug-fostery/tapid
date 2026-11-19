@@ -786,11 +786,24 @@ mod tests {
         poll_client(&authority, &mut client, 1).unwrap();
         assert!(client.pending.is_none());
         assert_eq!(client.id, 2);
-        let mut protocol = unsafe { zeroed() };
-        assert_ne!(
-            unsafe { WSADuplicateSocketW(socket, std::process::id(), &mut protocol) },
-            0
-        );
+        fn assert_closed(socket: SOCKET) {
+            let mut socket_type = 0;
+            let mut length = size_of::<i32>() as i32;
+            assert_eq!(
+                unsafe {
+                    getsockopt(
+                        socket,
+                        SOL_SOCKET,
+                        SO_TYPE,
+                        (&mut socket_type as *mut i32).cast(),
+                        &mut length,
+                    )
+                },
+                SOCKET_ERROR
+            );
+            assert_eq!(unsafe { WSAGetLastError() }, WSAENOTSOCK);
+        }
+        assert_closed(socket);
         let socket = unsafe { WSASocketW(2, 1, 6, null(), 0, WSA_FLAG_NO_HANDLE_INHERIT) };
         client.pending = Some(Pending {
             _socket: Socket(socket),
@@ -798,10 +811,7 @@ mod tests {
         });
         assert!(poll_client(&authority, &mut client, 1).is_err());
         drop(client);
-        assert_ne!(
-            unsafe { WSADuplicateSocketW(socket, std::process::id(), &mut protocol) },
-            0
-        );
+        assert_closed(socket);
     }
     #[test]
     fn reply_backpressure_and_broker_drop_have_bounded_work() {
